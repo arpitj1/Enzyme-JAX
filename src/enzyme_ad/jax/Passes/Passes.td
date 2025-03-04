@@ -130,7 +130,30 @@ def PrintPass : Pass<"print"> {
       /*CLI argument=*/"stdout",
       /*type=*/"bool",
       /*default=*/"true",
-      /*description=*/"Whether to print to stdout (vs stderr)">];
+      /*description=*/"Whether to print to stdout (vs stderr)">,
+      Option</*C++ variable name=*/"debug",
+      /*CLI argument=*/"debug",
+      /*type=*/"bool",
+      /*default=*/"false",
+      /*description=*/"Whether to print to stdout (vs stderr)">,
+      ];
+}
+
+def PrintLocationPass : Pass<"print-location"> {
+  let summary = "Print locations of attributed operations";
+  let options = [Option<
+      /*C++ variable name=*/"shouldPrint",
+      /*CLI argument=*/"print",
+      /*type=*/"bool",
+      /*default=*/"true",
+      /*description=*/"Whether to print the location">,
+    Option<
+      /*C++ variable name=*/"shouldAttach",
+      /*CLI argument=*/"attach",
+      /*type=*/"bool",
+      /*default=*/"true",
+      /*description=*/"Whether to attach the location as attribute">,
+    ];
 }
 
 def SROAWrappersPass : Pass<"sroa-wrappers", "mlir::ModuleOp"> {

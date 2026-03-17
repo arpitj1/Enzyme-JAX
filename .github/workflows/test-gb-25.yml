@@ -49,7 +49,7 @@ jobs:
 
         reactant_commit:
           - 'main'
-          - 'mst3'
+          - 'ss/apply-redirect-dus'
 
     steps:
       - name: Check GPUs

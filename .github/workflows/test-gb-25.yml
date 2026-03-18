@@ -48,7 +48,7 @@ jobs:
           # - '0123456789abcdef0123456789abcdef01234567'
 
         reactant_commit:
-          - '9344280654cc37e587d27ab63ff77d09f1804d83' # main before breaking pr
+          - 'main'
           - 'ss/apply-redirect-dus'
 
     steps:

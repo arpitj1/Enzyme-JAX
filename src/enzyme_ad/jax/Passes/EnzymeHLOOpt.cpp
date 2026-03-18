@@ -12769,6 +12769,9 @@ struct DUSSliceSimplify final
   }
 };
 
+static bool mayReadMemoryWrittenTo(stablehlo::SliceOp,
+                                   stablehlo::DynamicUpdateSliceOp);
+
 // Given B = dus(A, update_b, idx_b), redirect slice(A) → slice(B) when the
 // slice region does not overlap B's update region. This lets the bufferizer
 // reuse A's buffer for B in-place once A has no other non-B users.
@@ -12813,16 +12816,7 @@ struct RedirectSliceThroughDUS final
       // (slice ends before update starts) or a >= d (slice starts
       // after update ends)
       if (auto sliceOp = dyn_cast<stablehlo::SliceOp>(user)) {
-        bool noOverlap = false;
-        for (auto [sliceStart, sliceLimit, dusStart, uSize] :
-             llvm::zip(sliceOp.getStartIndices(), sliceOp.getLimitIndices(),
-                       dusStarts, updateShape)) {
-          if (sliceLimit <= dusStart || sliceStart >= dusStart + uSize) {
-            noOverlap = true;
-            break;
-          }
-        }
-        if (noOverlap) {
+        if (!mayReadMemoryWrittenTo(sliceOp, dusOp)) {
           rewriter.modifyOpInPlace(sliceOp, [&]() { use.set(result); });
           anyRedirected = true;
         }

@@ -516,13 +516,17 @@ struct DotGeneralOpConversion : public OpConversionPattern<stablehlo::DotGeneral
     auto prodType = RankedTensorType::get(origShape, f32Type);
 
     Value hi_hi = rewriter.create<stablehlo::DotGeneralOp>(
-        loc, prodType, lhs_hi, rhs_hi, op.getDotDimensionNumbers());
+        loc, prodType, lhs_hi, rhs_hi, op.getDotDimensionNumbers(),
+        op.getPrecisionConfigAttr(), op.getAlgorithmAttr());
     Value hi_lo = rewriter.create<stablehlo::DotGeneralOp>(
-        loc, prodType, lhs_hi, rhs_lo, op.getDotDimensionNumbers());
+        loc, prodType, lhs_hi, rhs_lo, op.getDotDimensionNumbers(),
+        op.getPrecisionConfigAttr(), op.getAlgorithmAttr());
     Value lo_hi = rewriter.create<stablehlo::DotGeneralOp>(
-        loc, prodType, lhs_lo, rhs_hi, op.getDotDimensionNumbers());
+        loc, prodType, lhs_lo, rhs_hi, op.getDotDimensionNumbers(),
+        op.getPrecisionConfigAttr(), op.getAlgorithmAttr());
     Value lo_lo = rewriter.create<stablehlo::DotGeneralOp>(
-        loc, prodType, lhs_lo, rhs_lo, op.getDotDimensionNumbers());
+        loc, prodType, lhs_lo, rhs_lo, op.getDotDimensionNumbers(),
+        op.getPrecisionConfigAttr(), op.getAlgorithmAttr());
 
     Value L = rewriter.create<stablehlo::AddOp>(loc, hi_lo, lo_hi);
     L = rewriter.create<stablehlo::AddOp>(loc, L, lo_lo);
@@ -533,6 +537,7 @@ struct DotGeneralOpConversion : public OpConversionPattern<stablehlo::DotGeneral
   }
 };
 
+struct ConcatenateOpOptimization : public OpConversionPattern<stablehlo::ConcatenateOp> {
   using OpConversionPattern<stablehlo::ConcatenateOp>::OpConversionPattern;
 
   LogicalResult matchAndRewrite(stablehlo::ConcatenateOp op, OpAdaptor adaptor,

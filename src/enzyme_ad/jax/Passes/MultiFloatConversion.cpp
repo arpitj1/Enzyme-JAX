@@ -255,6 +255,41 @@ struct SubOpConversion : public OpConversionPattern<stablehlo::SubtractOp> {
   }
 };
 
+struct DivOpConversion : public OpConversionPattern<stablehlo::DivOp> {
+  DivOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::DivOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  StringRef concatDimension;
+
+  LogicalResult matchAndRewrite(stablehlo::DivOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+
+    Value x1 = extractLimb(adaptor.getOperands()[0], 0, rewriter, loc, concatDimension);
+    Value x2 = extractLimb(adaptor.getOperands()[0], 1, rewriter, loc, concatDimension);
+    Value y1 = extractLimb(adaptor.getOperands()[1], 0, rewriter, loc, concatDimension);
+    Value y2 = extractLimb(adaptor.getOperands()[1], 1, rewriter, loc, concatDimension);
+
+    Value z_hi = rewriter.create<stablehlo::DivOp>(loc, x1, y1);
+
+    auto [p_hi, p_l] = twoProdDekker(z_hi, y1, rewriter, loc);
+
+    Value d1 = rewriter.create<stablehlo::SubtractOp>(loc, x1, p_hi);
+    Value d2 = rewriter.create<stablehlo::SubtractOp>(loc, d1, p_l);
+    Value d3 = rewriter.create<stablehlo::AddOp>(loc, d2, x2);
+    Value q = rewriter.create<stablehlo::MulOp>(loc, z_hi, y2);
+    Value r = rewriter.create<stablehlo::SubtractOp>(loc, d3, q);
+
+    Value z_lo = rewriter.create<stablehlo::DivOp>(loc, r, y1);
+
+    auto [final_h, final_l] = fastTwoSum(z_hi, z_lo, rewriter, loc);
+
+    Value packed = packLimbs(final_h, final_l, rewriter, loc, concatDimension);
+    rewriter.replaceOp(op, packed);
+    return success();
+  }
+};
+
 struct SelectOpConversion : public OpConversionPattern<stablehlo::SelectOp> {
   StringRef concatDimension;
 
@@ -554,6 +589,10 @@ struct ConcatenateOpOptimization : public OpConversionPattern<stablehlo::Concate
       if (!defOp->hasTrait<mlir::OpTrait::Elementwise>()) return failure();
       if (defOp->getAttrDictionary() != firstOp->getAttrDictionary()) return failure();
       if (defOp->getNumOperands() != firstOp->getNumOperands()) return failure();
+
+      for (auto *user : defOp->getUsers()) {
+        if (user != op) return failure();
+      }
     }
 
     SmallVector<Value> newOperands;
@@ -582,6 +621,155 @@ struct ConcatenateOpOptimization : public OpConversionPattern<stablehlo::Concate
 
     Operation *newOp = rewriter.create(state);
     rewriter.replaceOp(op, newOp->getResults());
+    return success();
+  }
+};
+
+
+struct ConcatenateOpConversion : public OpConversionPattern<stablehlo::ConcatenateOp> {
+  StringRef concatDimension;
+
+  ConcatenateOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::ConcatenateOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(stablehlo::ConcatenateOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    if (concatDimension == "tuple") {
+      auto tupleType = cast<TupleType>(getTypeConverter()->convertType(op.getType()));
+      SmallVector<Value> hiOperands, loOperands;
+      for (auto operand : adaptor.getOperands()) {
+        hiOperands.push_back(extractLimb(operand, 0, rewriter, loc, "tuple"));
+        loOperands.push_back(extractLimb(operand, 1, rewriter, loc, "tuple"));
+      }
+      Value hi = rewriter.create<stablehlo::ConcatenateOp>(loc, tupleType.getType(0), hiOperands, op.getDimension());
+      Value lo = rewriter.create<stablehlo::ConcatenateOp>(loc, tupleType.getType(1), loOperands, op.getDimension());
+      Value packed = packLimbs(hi, lo, rewriter, loc, "tuple");
+      rewriter.replaceOp(op, packed);
+      return success();
+    }
+
+    auto outType = cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+
+    int64_t dim = op.getDimension();
+    int64_t mappedDim = dim;
+    if (concatDimension == "first") {
+      mappedDim = dim + 1;
+    } else if (concatDimension == "last") {
+      mappedDim = dim;
+    }
+
+    Value newOp = rewriter.create<stablehlo::ConcatenateOp>(loc, outType, adaptor.getOperands(), mappedDim);
+    rewriter.replaceOp(op, newOp);
+    return success();
+  }
+};
+
+struct PadOpConversion : public OpConversionPattern<stablehlo::PadOp> {
+  StringRef concatDimension;
+
+  PadOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::PadOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(stablehlo::PadOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto outType = cast<RankedTensorType>(getTypeConverter()->convertType(op->getResult(0).getType()));
+
+    if (concatDimension == "tuple") {
+      auto tupleType = cast<TupleType>(getTypeConverter()->convertType(op.getType()));
+      Value hiOperand = extractLimb(adaptor.getOperand(), 0, rewriter, loc, "tuple");
+      Value loOperand = extractLimb(adaptor.getOperand(), 1, rewriter, loc, "tuple");
+      
+      Value hiPadValue = extractLimb(adaptor.getPaddingValue(), 0, rewriter, loc, "tuple");
+      Value loPadValue = extractLimb(adaptor.getPaddingValue(), 1, rewriter, loc, "tuple");
+
+      Value hi = rewriter.create<stablehlo::PadOp>(loc, tupleType.getType(0), hiOperand, hiPadValue, op.getEdgePaddingLow(), op.getEdgePaddingHigh(), op.getInteriorPadding());
+      Value lo = rewriter.create<stablehlo::PadOp>(loc, tupleType.getType(1), loOperand, loPadValue, op.getEdgePaddingLow(), op.getEdgePaddingHigh(), op.getInteriorPadding());
+      Value packed = packLimbs(hi, lo, rewriter, loc, "tuple");
+      rewriter.replaceOp(op, packed);
+      return success();
+    }
+
+    Value padValue = adaptor.getPaddingValue();
+    bool isSymmetric = false;
+    Value origPadValue = op.getPaddingValue();
+    auto origPadConst = origPadValue.getDefiningOp<stablehlo::ConstantOp>();
+    
+    if (origPadConst) {
+        if (auto elementsAttr = dyn_cast<SplatElementsAttr>(origPadConst.getValue())) {
+            if (auto floatAttr = dyn_cast<FloatAttr>(elementsAttr.getSplatValue<Attribute>())) {
+                if (floatAttr.getValueAsDouble() == 0.0) {
+                    isSymmetric = true;
+                }
+            }
+        }
+    }
+
+    if (isSymmetric) {
+        auto floatTy = cast<FloatType>(cast<RankedTensorType>(outType).getElementType());
+        auto zeroAttr = rewriter.getFloatAttr(floatTy, 0.0);
+        auto splatAttr = SplatElementsAttr::get(RankedTensorType::get({}, floatTy), zeroAttr);
+        Value zeroConst = rewriter.create<stablehlo::ConstantOp>(loc, splatAttr);
+
+        SmallVector<int64_t> low = llvm::to_vector(op.getEdgePaddingLow());
+        SmallVector<int64_t> high = llvm::to_vector(op.getEdgePaddingHigh());
+        SmallVector<int64_t> interior = llvm::to_vector(op.getInteriorPadding());
+
+        if (concatDimension == "first") {
+            low.insert(low.begin(), 0);
+            high.insert(high.begin(), 0);
+            interior.insert(interior.begin(), 0);
+        } else if (concatDimension == "last") {
+            low.push_back(0);
+            high.push_back(0);
+            interior.push_back(0);
+        }
+
+        Value newOp = rewriter.create<stablehlo::PadOp>(loc, adaptor.getOperand(), zeroConst, 
+                                                        rewriter.getDenseI64ArrayAttr(low), 
+                                                        rewriter.getDenseI64ArrayAttr(high), 
+                                                        rewriter.getDenseI64ArrayAttr(interior));
+        rewriter.replaceOp(op, newOp);
+        return success();
+    }
+
+    Value hiOperand = extractLimb(adaptor.getOperand(), 0, rewriter, loc, concatDimension);
+    Value loOperand = extractLimb(adaptor.getOperand(), 1, rewriter, loc, concatDimension);
+
+    Value hiPadValue = extractLimb(padValue, 0, rewriter, loc, concatDimension);
+    Value loPadValue = extractLimb(padValue, 1, rewriter, loc, concatDimension);
+
+    // Reshape pad values to rank 0 scalar
+    auto scalarType = RankedTensorType::get({}, cast<RankedTensorType>(hiPadValue.getType()).getElementType());
+    hiPadValue = rewriter.create<stablehlo::ReshapeOp>(loc, scalarType, hiPadValue);
+    loPadValue = rewriter.create<stablehlo::ReshapeOp>(loc, scalarType, loPadValue);
+
+    SmallVector<int64_t> low = llvm::to_vector(op.getEdgePaddingLow());
+    SmallVector<int64_t> high = llvm::to_vector(op.getEdgePaddingHigh());
+    SmallVector<int64_t> interior = llvm::to_vector(op.getInteriorPadding());
+
+    if (concatDimension == "first") {
+        low.insert(low.begin(), 0);
+        high.insert(high.begin(), 0);
+        interior.insert(interior.begin(), 0);
+    } else if (concatDimension == "last") {
+        low.push_back(0);
+        high.push_back(0);
+        interior.push_back(0);
+    }
+
+    Value hi = rewriter.create<stablehlo::PadOp>(loc, hiOperand, hiPadValue, 
+                                                    rewriter.getDenseI64ArrayAttr(low), 
+                                                    rewriter.getDenseI64ArrayAttr(high), 
+                                                    rewriter.getDenseI64ArrayAttr(interior));
+    Value lo = rewriter.create<stablehlo::PadOp>(loc, loOperand, loPadValue, 
+                                                    rewriter.getDenseI64ArrayAttr(low), 
+                                                    rewriter.getDenseI64ArrayAttr(high), 
+                                                    rewriter.getDenseI64ArrayAttr(interior));
+
+    Value packed = packLimbs(hi, lo, rewriter, loc, concatDimension);
+    rewriter.replaceOp(op, packed);
     return success();
   }
 };
@@ -691,7 +879,13 @@ struct MultiFloatConversionPass
     target.addDynamicallyLegalOp<stablehlo::MulOp>([&](stablehlo::MulOp op) {
       return typeConverter.isLegal(op.getType());
     });
+    target.addDynamicallyLegalOp<stablehlo::DivOp>([&](stablehlo::DivOp op) {
+      return typeConverter.isLegal(op.getType());
+    });
     target.addDynamicallyLegalOp<stablehlo::SelectOp>([&](stablehlo::SelectOp op) {
+      return typeConverter.isLegal(op.getType());
+    });
+    target.addDynamicallyLegalOp<stablehlo::PadOp>([&](stablehlo::PadOp op) {
       return typeConverter.isLegal(op.getType());
     });
 
@@ -699,13 +893,16 @@ struct MultiFloatConversionPass
     patterns.add<AddOpConversion>(typeConverter, context, concatDimension);
     patterns.add<SubOpConversion>(typeConverter, context, concatDimension);
     patterns.add<MulOpConversion>(typeConverter, context, concatDimension);
+    patterns.add<DivOpConversion>(typeConverter, context, concatDimension);
     patterns.add<SelectOpConversion>(typeConverter, context, concatDimension);
     patterns.add<SliceOpConversion>(typeConverter, context, concatDimension);
     patterns.add<BroadcastInDimOpConversion>(typeConverter, context, concatDimension);
     patterns.add<TransposeOpConversion>(typeConverter, context, concatDimension);
     patterns.add<ReshapeOpConversion>(typeConverter, context, concatDimension);
     patterns.add<DotGeneralOpConversion>(typeConverter, context, concatDimension);
+    patterns.add<PadOpConversion>(typeConverter, context, concatDimension);
     patterns.add<ConcatenateOpOptimization>(typeConverter, context);
+    patterns.add<ConcatenateOpConversion>(typeConverter, context, concatDimension);
 
 
     if (failed(applyPartialConversion(op, target, std::move(patterns)))) {

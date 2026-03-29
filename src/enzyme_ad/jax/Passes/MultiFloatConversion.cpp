@@ -1174,7 +1174,7 @@ struct MultiFloatConversionPass
     patterns.add<WhileOpConversion>(typeConverter, context, concatDimension);
     patterns.add<ReturnOpConversion>(typeConverter, context);
     patterns.add<ReduceWindowOpConversion>(typeConverter, context, concatDimension);
-    patterns.add<ConcatenateOpOptimization>(typeConverter, context);
+    patterns.add<ConcatenateOpOptimization>(typeConverter, context, 2);
     patterns.add<ConcatenateOpConversion>(typeConverter, context, concatDimension);
 
 

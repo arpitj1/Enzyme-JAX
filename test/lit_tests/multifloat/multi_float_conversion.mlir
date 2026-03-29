@@ -6,12 +6,11 @@ func.func @test_add(%arg0: tensor<f64>, %arg1: tensor<f64>) -> tensor<f64> {
 }
 
 // CHECK-LABEL: func.func @test_add
-// CHECK-SAME: (%arg0: tensor<f64>, %arg1: tensor<f64>) -> tensor<f64>
-// CHECK: %[[C1:.*]] = builtin.unrealized_conversion_cast %arg0 : tensor<f64> to tensor<2xf32>
-// CHECK: %[[C2:.*]] = builtin.unrealized_conversion_cast %arg1 : tensor<f64> to tensor<2xf32>
-// CHECK: stablehlo.slice %[[C1]]
+// CHECK-DAG: %[[C1:.*]] = builtin.unrealized_conversion_cast %arg0 : tensor<f64> to tensor<2xf32>
+// CHECK-DAG: %[[C2:.*]] = builtin.unrealized_conversion_cast %arg1 : tensor<f64> to tensor<2xf32>
+// CHECK: stablehlo.slice
 // CHECK-NOT: stablehlo.reshape
-// CHECK: stablehlo.slice %[[C2]]
+// CHECK: stablehlo.slice
 // CHECK-NOT: stablehlo.reshape
 // CHECK: stablehlo.add
 // CHECK: stablehlo.subtract

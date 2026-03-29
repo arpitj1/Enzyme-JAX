@@ -260,10 +260,10 @@ struct ConcatenateOpOptimization : public OpConversionPattern<stablehlo::Concate
 
   LogicalResult matchAndRewrite(stablehlo::ConcatenateOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
-    if (adaptor.getOperands().size() != 2) return failure();
+    if (op.getOperands().size() != 2) return failure();
 
-    Value lhs = adaptor.getOperands()[0];
-    Value rhs = adaptor.getOperands()[1];
+    Value lhs = op.getOperands()[0];
+    Value rhs = op.getOperands()[1];
 
     Operation *lhsOp = lhs.getDefiningOp();
     Operation *rhsOp = rhs.getDefiningOp();
@@ -283,8 +283,13 @@ struct ConcatenateOpOptimization : public OpConversionPattern<stablehlo::Concate
       Value l_op = lhsOp->getOperand(i);
       Value r_op = rhsOp->getOperand(i);
       
+      auto type = cast<RankedTensorType>(l_op.getType());
+      SmallVector<int64_t> newShape = llvm::to_vector(type.getShape());
+      newShape[op.getDimension()] += cast<RankedTensorType>(r_op.getType()).getShape()[op.getDimension()];
+      auto outType = RankedTensorType::get(newShape, type.getElementType());
+
       auto newConcat = rewriter.create<stablehlo::ConcatenateOp>(
-          op.getLoc(), l_op.getType(), ValueRange{l_op, r_op}, op.getDimension());
+          op.getLoc(), outType, ValueRange{l_op, r_op}, op.getDimension());
       newOperands.push_back(newConcat);
     }
 
@@ -355,7 +360,15 @@ struct MultiFloatConversionPass
       }
       return type;
     });
-
+    
+    typeConverter.addSourceMaterialization([](OpBuilder &builder, Type type, ValueRange inputs, Location loc) -> Value {
+      if (inputs.size() != 1) return Value();
+      return builder.create<UnrealizedConversionCastOp>(loc, type, inputs[0]).getResult(0);
+    });
+    typeConverter.addTargetMaterialization([](OpBuilder &builder, Type type, ValueRange inputs, Location loc) -> Value {
+      if (inputs.size() != 1) return Value();
+      return builder.create<UnrealizedConversionCastOp>(loc, type, inputs[0]).getResult(0);
+    });
 
     target.addLegalOp<UnrealizedConversionCastOp>();
     target.addDynamicallyLegalOp<stablehlo::ConcatenateOp>([&](stablehlo::ConcatenateOp op) {

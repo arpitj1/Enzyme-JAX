@@ -255,6 +255,50 @@ struct SubOpConversion : public OpConversionPattern<stablehlo::SubtractOp> {
   }
 };
 
+struct ConcatenateOpOptimization : public OpConversionPattern<stablehlo::ConcatenateOp> {
+  using OpConversionPattern<stablehlo::ConcatenateOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(stablehlo::ConcatenateOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    if (adaptor.getOperands().size() != 2) return failure();
+
+    Value lhs = adaptor.getOperands()[0];
+    Value rhs = adaptor.getOperands()[1];
+
+    Operation *lhsOp = lhs.getDefiningOp();
+    Operation *rhsOp = rhs.getDefiningOp();
+
+    if (!lhsOp || !rhsOp) return failure();
+
+    if (lhsOp->getName() != rhsOp->getName()) return failure();
+
+    if (!lhsOp->hasTrait<mlir::OpTrait::Elementwise>()) return failure();
+
+    if (lhsOp->getAttrDictionary() != rhsOp->getAttrDictionary()) return failure();
+
+    if (lhsOp->getNumOperands() != rhsOp->getNumOperands()) return failure();
+
+    SmallVector<Value> newOperands;
+    for (unsigned i = 0; i < lhsOp->getNumOperands(); ++i) {
+      Value l_op = lhsOp->getOperand(i);
+      Value r_op = rhsOp->getOperand(i);
+      
+      auto newConcat = rewriter.create<stablehlo::ConcatenateOp>(
+          op.getLoc(), l_op.getType(), ValueRange{l_op, r_op}, op.getDimension());
+      newOperands.push_back(newConcat);
+    }
+
+    OperationState state(op.getLoc(), lhsOp->getName().getStringRef());
+    state.addOperands(newOperands);
+    state.addAttributes(lhsOp->getAttrDictionary().getValue());
+    state.addTypes(op.getType());
+
+    Operation *newOp = rewriter.create(state);
+    rewriter.replaceOp(op, newOp->getResults());
+    return success();
+  }
+};
+
 struct MultiFloatConversionPass
     : public enzyme::impl::MultiFloatConversionPassBase<MultiFloatConversionPass> {
   using MultiFloatConversionPassBase::MultiFloatConversionPassBase;
@@ -313,6 +357,17 @@ struct MultiFloatConversionPass
     });
 
 
+    target.addLegalOp<UnrealizedConversionCastOp>();
+    target.addDynamicallyLegalOp<stablehlo::ConcatenateOp>([&](stablehlo::ConcatenateOp op) {
+      if (op.getOperands().size() != 2) return true;
+      Operation *lhsOp = op.getOperands()[0].getDefiningOp();
+      Operation *rhsOp = op.getOperands()[1].getDefiningOp();
+      if (!lhsOp || !rhsOp) return true;
+      if (lhsOp->getName() != rhsOp->getName()) return true;
+      if (!lhsOp->hasTrait<mlir::OpTrait::Elementwise>()) return true;
+      if (lhsOp->getAttrDictionary() != rhsOp->getAttrDictionary()) return true;
+      return false; // Not legal if it can be optimized!
+    });
     target.addDynamicallyLegalOp<stablehlo::AddOp>([&](stablehlo::AddOp op) {
       return typeConverter.isLegal(op.getType());
     });
@@ -327,6 +382,7 @@ struct MultiFloatConversionPass
     patterns.add<AddOpConversion>(typeConverter, context, concatDimension);
     patterns.add<SubOpConversion>(typeConverter, context, concatDimension);
     patterns.add<MulOpConversion>(typeConverter, context, concatDimension);
+    patterns.add<ConcatenateOpOptimization>(typeConverter, context);
 
 
     if (failed(applyPartialConversion(op, target, std::move(patterns)))) {

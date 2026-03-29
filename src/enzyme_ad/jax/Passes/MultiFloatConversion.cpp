@@ -124,13 +124,34 @@ std::pair<Value, Value> fastTwoSum(Value a, Value b, OpBuilder &builder, Locatio
   return {sum, b_err};
 }
 
+std::pair<int, int> getFloatProperties(Type type) {
+  auto floatTy = dyn_cast<FloatType>(type);
+  if (!floatTy) return {0, 0};
+  if (floatTy.getWidth() == 64) return {11, 53};
+  if (floatTy.getWidth() == 32) return {8, 24};
+  if (floatTy.getWidth() == 16) return floatTy.isF16() ? std::make_pair(5, 11) : std::make_pair(8, 8);
+  if (floatTy.getWidth() == 8) return isa<Float8E4M3FNType>(floatTy) ? std::make_pair(4, 4) : std::make_pair(5, 3);
+  return {0, 0};
+}
+
+int getFloatPrecision(Type type) {
+  return getFloatProperties(type).second;
+}
+
+bool atLeastAsPreciseAs(Type a, Type b) {
+  return getFloatPrecision(a) >= getFloatPrecision(b);
+}
+
+bool isSubsetFloat(Type a, Type b) {
+  auto pA = getFloatProperties(a);
+  auto pB = getFloatProperties(b);
+  return pA.first <= pB.first && pA.second <= pB.second;
+}
+
 Value getSplitConstant(Type type, OpBuilder &builder, Location loc) {
   auto tensorTy = cast<RankedTensorType>(type);
   auto floatTy = cast<FloatType>(tensorTy.getElementType());
-  int precision = floatTy.getWidth() == 64 ? 53 :
-                   floatTy.getWidth() == 32 ? 24 :
-                   floatTy.getWidth() == 16 ? (floatTy.isF16() ? 11 : 8) :
-                   floatTy.getWidth() == 8 ? (isa<Float8E4M3FNType>(floatTy) ? 4 : 3) : 0;
+  int precision = getFloatPrecision(floatTy);
   if (precision == 0) return nullptr;
   int k = (precision + 1) / 2;
   double val = std::pow(2.0, k) + 1.0;
@@ -399,29 +420,75 @@ struct ConvertOpConversion : public OpConversionPattern<stablehlo::ConvertOp> {
       limbType = RankedTensorType::get(limbShape, targetType);
     }
 
-    // Case 1: Source to Target (e.g., f64 -> f32)
-    if (inElType == sourceType && outElType == targetType) {
-      Value high = extractLimb(adaptor.getOperands()[0], 0, rewriter, loc, concatDimension);
-      if (!isTuple) {
-        high = rewriter.create<stablehlo::ReshapeOp>(loc, RankedTensorType::get(outTensorType.getShape(), targetType), high);
+    // Case 1: Source to Standard (Expanded to Standard)
+    if (inElType == sourceType && outElType != sourceType && !outElType.isIntOrIndex()) {
+      if (isSubsetFloat(outElType, targetType)) {
+        Value high = extractLimb(adaptor.getOperands()[0], 0, rewriter, loc, concatDimension);
+        if (!isTuple) {
+          high = rewriter.create<stablehlo::ReshapeOp>(loc, RankedTensorType::get(outTensorType.getShape(), targetType), high);
+        }
+        if (outElType != targetType) {
+          high = rewriter.create<stablehlo::ConvertOp>(loc, RankedTensorType::get(outTensorType.getShape(), outElType), high);
+        }
+        rewriter.replaceOp(op, high);
+        return success();
+      } else {
+        // Output is wider than a limb, sum limbs
+        Value sum = nullptr;
+        for (int i = 0; i < 2; ++i) { // Assuming expansion size 2
+          Value limb = extractLimb(adaptor.getOperands()[0], i, rewriter, loc, concatDimension);
+          if (!isTuple) {
+            limb = rewriter.create<stablehlo::ReshapeOp>(loc, RankedTensorType::get(outTensorType.getShape(), targetType), limb);
+          }
+          Value convertedLimb = rewriter.create<stablehlo::ConvertOp>(loc, RankedTensorType::get(outTensorType.getShape(), outElType), limb);
+          if (sum) {
+            sum = rewriter.create<stablehlo::AddOp>(loc, sum, convertedLimb);
+          } else {
+            sum = convertedLimb;
+          }
+        }
+        rewriter.replaceOp(op, sum);
+        return success();
       }
-      rewriter.replaceOp(op, high);
-      return success();
     }
 
-    // Case 2: Target to Source (e.g., f32 -> f64)
-    if (inElType == targetType && outElType == sourceType) {
-      Value high = adaptor.getOperands()[0];
-      Value low = rewriter.create<stablehlo::ConstantOp>(loc, rewriter.getZeroAttr(limbType));
-      
-      Value highPacked = high;
-      if (!isTuple) {
-        highPacked = rewriter.create<stablehlo::ReshapeOp>(loc, limbType, high);
+    // Case 2: Standard to Source (Standard to Expanded)
+    if (outElType == sourceType && inElType != sourceType && !inElType.isIntOrIndex()) {
+      if (isSubsetFloat(inElType, targetType)) {
+        Value high = adaptor.getOperands()[0];
+        if (inElType != targetType) {
+          high = rewriter.create<stablehlo::ConvertOp>(loc, RankedTensorType::get(inTensorType.getShape(), targetType), high);
+        }
+        Value low = rewriter.create<stablehlo::ConstantOp>(loc, rewriter.getZeroAttr(limbType));
+        
+        Value highPacked = high;
+        if (!isTuple) {
+          highPacked = rewriter.create<stablehlo::ReshapeOp>(loc, limbType, high);
+        }
+        
+        Value packed = packLimbs(highPacked, low, rewriter, loc, concatDimension);
+        rewriter.replaceOp(op, packed);
+        return success();
+      } else {
+        // Input is wider or not a subset. Convert to sourceType first, then split.
+        Value converted = rewriter.create<stablehlo::ConvertOp>(loc, RankedTensorType::get(inTensorType.getShape(), sourceType), adaptor.getOperands()[0]);
+        
+        Value high = rewriter.create<stablehlo::ConvertOp>(loc, RankedTensorType::get(outTensorType.getShape(), targetType), converted);
+        Value highBack = rewriter.create<stablehlo::ConvertOp>(loc, outTensorType, high);
+        Value rem = rewriter.create<stablehlo::SubtractOp>(loc, converted, highBack);
+        Value low = rewriter.create<stablehlo::ConvertOp>(loc, RankedTensorType::get(outTensorType.getShape(), targetType), rem);
+        
+        Value highPacked = high;
+        Value lowPacked = low;
+        if (!isTuple) {
+          highPacked = rewriter.create<stablehlo::ReshapeOp>(loc, limbType, high);
+          lowPacked = rewriter.create<stablehlo::ReshapeOp>(loc, limbType, low);
+        }
+        
+        Value packed = packLimbs(highPacked, lowPacked, rewriter, loc, concatDimension);
+        rewriter.replaceOp(op, packed);
+        return success();
       }
-      
-      Value packed = packLimbs(highPacked, low, rewriter, loc, concatDimension);
-      rewriter.replaceOp(op, packed);
-      return success();
     }
 
     // Case 3: Integer to Source Type
@@ -1464,16 +1531,19 @@ struct MultiFloatConversionPass
     target.addDynamicallyLegalOp<stablehlo::MulOp>(mulLegal);
     target.addDynamicallyLegalOp<stablehlo::DivOp>(divLegal);
     target.addDynamicallyLegalOp<stablehlo::SelectOp>(selectLegal);
-    target.addDynamicallyLegalOp<stablehlo::ConvertOp>(
-        [&](stablehlo::ConvertOp op) {
-          Type inElType = cast<RankedTensorType>(op.getOperand().getType()).getElementType();
-          Type outElType = cast<RankedTensorType>(op.getResult().getType()).getElementType();
-          if ((inElType.isF64() && (outElType.isF32() || outElType.isF64())) ||
-              (outElType.isF64() && (inElType.isF32() || inElType.isIntOrIndex()))) {
-            return false;
-          }
-          return true;
-        });
+    target.addDynamicallyLegalOp<stablehlo::ConvertOp>([&](stablehlo::ConvertOp op) {
+      auto outTensorType = dyn_cast<RankedTensorType>(op.getResult().getType());
+      if (!outTensorType) return true;
+      auto inTensorType = dyn_cast<RankedTensorType>(op.getOperand().getType());
+      if (!inTensorType) return true;
+      Type outElType = outTensorType.getElementType();
+      Type inElType = inTensorType.getElementType();
+
+      if (outElType == srcTy && inElType != srcTy) return false;
+      if (inElType == srcTy && outElType != srcTy) return false;
+      if (outElType == srcTy && inElType == srcTy && op.getOperand().getType() == op.getResult().getType()) return false;
+      return true;
+    });
     target.addDynamicallyLegalOp<stablehlo::ReverseOp>(reverseLegal);
     target.addDynamicallyLegalOp<stablehlo::AbsOp>(absLegal);
     target.addDynamicallyLegalOp<stablehlo::SqrtOp>(sqrtLegal);

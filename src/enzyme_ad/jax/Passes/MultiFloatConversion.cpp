@@ -493,8 +493,46 @@ struct ReshapeOpConversion : public OpConversionPattern<stablehlo::ReshapeOp> {
 };
 
 
+struct DotGeneralOpConversion : public OpConversionPattern<stablehlo::DotGeneralOp> {
+  StringRef concatDimension;
 
-struct ConcatenateOpOptimization : public OpConversionPattern<stablehlo::ConcatenateOp> {
+  DotGeneralOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::DotGeneralOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(stablehlo::DotGeneralOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value lhs = adaptor.getOperands()[0];
+    Value rhs = adaptor.getOperands()[1];
+
+    Value lhs_hi = extractLimb(lhs, 0, rewriter, loc, concatDimension);
+    Value lhs_lo = extractLimb(lhs, 1, rewriter, loc, concatDimension);
+    Value rhs_hi = extractLimb(rhs, 0, rewriter, loc, concatDimension);
+    Value rhs_lo = extractLimb(rhs, 1, rewriter, loc, concatDimension);
+
+    auto origType = cast<RankedTensorType>(op.getType());
+    auto origShape = origType.getShape();
+    auto f32Type = rewriter.getF32Type();
+    auto prodType = RankedTensorType::get(origShape, f32Type);
+
+    Value hi_hi = rewriter.create<stablehlo::DotGeneralOp>(
+        loc, prodType, lhs_hi, rhs_hi, op.getDotDimensionNumbers());
+    Value hi_lo = rewriter.create<stablehlo::DotGeneralOp>(
+        loc, prodType, lhs_hi, rhs_lo, op.getDotDimensionNumbers());
+    Value lo_hi = rewriter.create<stablehlo::DotGeneralOp>(
+        loc, prodType, lhs_lo, rhs_hi, op.getDotDimensionNumbers());
+    Value lo_lo = rewriter.create<stablehlo::DotGeneralOp>(
+        loc, prodType, lhs_lo, rhs_lo, op.getDotDimensionNumbers());
+
+    Value L = rewriter.create<stablehlo::AddOp>(loc, hi_lo, lo_hi);
+    L = rewriter.create<stablehlo::AddOp>(loc, L, lo_lo);
+
+    Value packed = packLimbs(hi_hi, L, rewriter, loc, concatDimension);
+    rewriter.replaceOp(op, packed);
+    return success();
+  }
+};
+
   using OpConversionPattern<stablehlo::ConcatenateOp>::OpConversionPattern;
 
   LogicalResult matchAndRewrite(stablehlo::ConcatenateOp op, OpAdaptor adaptor,
@@ -661,6 +699,7 @@ struct MultiFloatConversionPass
     patterns.add<BroadcastInDimOpConversion>(typeConverter, context, concatDimension);
     patterns.add<TransposeOpConversion>(typeConverter, context, concatDimension);
     patterns.add<ReshapeOpConversion>(typeConverter, context, concatDimension);
+    patterns.add<DotGeneralOpConversion>(typeConverter, context, concatDimension);
     patterns.add<ConcatenateOpOptimization>(typeConverter, context);
 
 

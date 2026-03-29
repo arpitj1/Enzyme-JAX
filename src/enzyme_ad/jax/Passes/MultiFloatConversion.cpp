@@ -515,6 +515,7 @@ struct WhileOpConversion : public OpConversionPattern<stablehlo::WhileOp> {
       return failure();
 
     auto newWhileOp = rewriter.create<stablehlo::WhileOp>(loc, convertedTypes, adaptor.getOperands());
+    newWhileOp.getOperation()->setAttrs(op.getOperation()->getAttrs());
 
     rewriter.inlineRegionBefore(op.getCond(), newWhileOp.getCond(), newWhileOp.getCond().end());
     if (failed(rewriter.convertRegionTypes(&newWhileOp.getCond(), *getTypeConverter())))

@@ -342,6 +342,43 @@ struct SelectOpConversion : public OpConversionPattern<stablehlo::SelectOp> {
   }
 };
 
+struct ReverseOpConversion : public OpConversionPattern<stablehlo::ReverseOp> {
+  StringRef concatDimension;
+
+  ReverseOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::ReverseOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(stablehlo::ReverseOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    bool isTuple = concatDimension == "tuple";
+    bool isFirst = concatDimension == "first";
+
+    if (isTuple) {
+      Value high = extractLimb(adaptor.getOperands()[0], 0, rewriter, loc, concatDimension);
+      Value low = extractLimb(adaptor.getOperands()[0], 1, rewriter, loc, concatDimension);
+
+      Value revHigh = rewriter.create<stablehlo::ReverseOp>(loc, high, op.getDimensions());
+      Value revLow = rewriter.create<stablehlo::ReverseOp>(loc, low, op.getDimensions());
+
+      Value packed = packLimbs(revHigh, revLow, rewriter, loc, concatDimension);
+      rewriter.replaceOp(op, packed);
+      return success();
+    }
+
+    SmallVector<int64_t> dims = llvm::to_vector(op.getDimensions());
+    if (isFirst) {
+      for (auto &dim : dims) {
+        dim += 1;
+      }
+    }
+
+    Value reversed = rewriter.create<stablehlo::ReverseOp>(loc, adaptor.getOperands()[0], rewriter.getDenseI64ArrayAttr(dims));
+    rewriter.replaceOp(op, reversed);
+    return success();
+  }
+};
+
 struct SliceOpConversion : public OpConversionPattern<stablehlo::SliceOp> {
   StringRef concatDimension;
 
@@ -391,7 +428,175 @@ struct SliceOpConversion : public OpConversionPattern<stablehlo::SliceOp> {
     rewriter.replaceOp(op, sliceOp);
     return success();
   }
-};struct BroadcastInDimOpConversion : public OpConversionPattern<stablehlo::BroadcastInDimOp> {
+};
+
+struct AbsOpConversion : public OpConversionPattern<stablehlo::AbsOp> {
+  StringRef concatDimension;
+
+  AbsOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::AbsOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(stablehlo::AbsOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+
+    Value hi = extractLimb(adaptor.getOperands()[0], 0, rewriter, loc, concatDimension);
+    Value lo = extractLimb(adaptor.getOperands()[0], 1, rewriter, loc, concatDimension);
+
+    auto tensorType = cast<RankedTensorType>(hi.getType());
+    auto floatTy = cast<FloatType>(tensorType.getElementType());
+
+    auto zeroAttr = rewriter.getFloatAttr(floatTy, 0.0);
+    auto splatAttr = SplatElementsAttr::get(tensorType, zeroAttr);
+    Value zero = rewriter.create<stablehlo::ConstantOp>(loc, splatAttr);
+
+    Value isPositive = rewriter.create<stablehlo::CompareOp>(loc, hi, zero, stablehlo::ComparisonDirection::GE);
+
+    Value neg_hi = rewriter.create<stablehlo::NegOp>(loc, hi);
+    Value neg_lo = rewriter.create<stablehlo::NegOp>(loc, lo);
+
+    Value res_hi = rewriter.create<stablehlo::SelectOp>(loc, isPositive, hi, neg_hi);
+    Value res_lo = rewriter.create<stablehlo::SelectOp>(loc, isPositive, lo, neg_lo);
+
+    Value packed = packLimbs(res_hi, res_lo, rewriter, loc, concatDimension);
+    rewriter.replaceOp(op, packed);
+    return success();
+  }
+};
+
+struct SqrtOpConversion : public OpConversionPattern<stablehlo::SqrtOp> {
+  StringRef concatDimension;
+
+  SqrtOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::SqrtOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(stablehlo::SqrtOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+
+    Value x_hi = extractLimb(adaptor.getOperands()[0], 0, rewriter, loc, concatDimension);
+    Value x_lo = extractLimb(adaptor.getOperands()[0], 1, rewriter, loc, concatDimension);
+
+    auto tensorType = cast<RankedTensorType>(x_hi.getType());
+    auto floatTy = cast<FloatType>(tensorType.getElementType());
+
+    Value z_hi = rewriter.create<stablehlo::SqrtOp>(loc, x_hi);
+    Value p = rewriter.create<stablehlo::MulOp>(loc, z_hi, z_hi);
+    Value d = rewriter.create<stablehlo::SubtractOp>(loc, x_hi, p);
+    Value r = rewriter.create<stablehlo::AddOp>(loc, d, x_lo);
+
+    auto twoAttr = rewriter.getFloatAttr(floatTy, 2.0);
+    auto splatTwo = SplatElementsAttr::get(tensorType, twoAttr);
+    Value two = rewriter.create<stablehlo::ConstantOp>(loc, splatTwo);
+
+    Value two_z_hi = rewriter.create<stablehlo::MulOp>(loc, two, z_hi);
+    Value z_lo = rewriter.create<stablehlo::DivOp>(loc, r, two_z_hi);
+
+    auto [final_h, final_l] = fastTwoSum(z_hi, z_lo, rewriter, loc);
+
+    Value packed = packLimbs(final_h, final_l, rewriter, loc, concatDimension);
+    rewriter.replaceOp(op, packed);
+    return success();
+  }
+};
+
+struct WhileOpConversion : public OpConversionPattern<stablehlo::WhileOp> {
+  StringRef concatDimension;
+
+  WhileOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::WhileOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(stablehlo::WhileOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+
+    SmallVector<Type> convertedTypes;
+    if (failed(getTypeConverter()->convertTypes(op.getOperandTypes(), convertedTypes)))
+      return failure();
+
+    auto newWhileOp = rewriter.create<stablehlo::WhileOp>(loc, convertedTypes, adaptor.getOperands());
+
+    rewriter.inlineRegionBefore(op.getCond(), newWhileOp.getCond(), newWhileOp.getCond().end());
+    if (failed(rewriter.convertRegionTypes(&newWhileOp.getCond(), *getTypeConverter())))
+      return failure();
+
+    rewriter.inlineRegionBefore(op.getBody(), newWhileOp.getBody(), newWhileOp.getBody().end());
+    if (failed(rewriter.convertRegionTypes(&newWhileOp.getBody(), *getTypeConverter())))
+      return failure();
+
+    rewriter.replaceOp(op, newWhileOp.getResults());
+    return success();
+  }
+};
+
+struct ReturnOpConversion : public OpConversionPattern<stablehlo::ReturnOp> {
+  using OpConversionPattern<stablehlo::ReturnOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(stablehlo::ReturnOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Value> convertedOperands;
+    for (auto operand : adaptor.getOperands()) {
+      convertedOperands.push_back(operand);
+    }
+    rewriter.replaceOpWithNewOp<stablehlo::ReturnOp>(op, convertedOperands);
+    return success();
+  }
+};
+
+struct ReduceWindowOpConversion : public OpConversionPattern<stablehlo::ReduceWindowOp> {
+  StringRef concatDimension;
+
+  ReduceWindowOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::ReduceWindowOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(stablehlo::ReduceWindowOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    bool isTuple = concatDimension == "tuple";
+
+    if (isTuple) {
+      return failure();
+    }
+
+    Value operand = adaptor.getOperands()[0];
+    Value initValue = adaptor.getOperands()[1];
+
+    Value hi_operand = extractLimb(operand, 0, rewriter, loc, concatDimension);
+    Value lo_operand = extractLimb(operand, 1, rewriter, loc, concatDimension);
+    Value hi_init = extractLimb(initValue, 0, rewriter, loc, concatDimension);
+    Value lo_init = extractLimb(initValue, 1, rewriter, loc, concatDimension);
+
+    auto outType = cast<RankedTensorType>(op.getType());
+    auto f32Type = rewriter.getF32Type();
+    auto partType = RankedTensorType::get(outType.getShape(), f32Type);
+
+    auto hi_op = rewriter.create<stablehlo::ReduceWindowOp>(
+        loc, partType, hi_operand, hi_init,
+        op.getWindowDimensions(), op.getWindowStrides(),
+        op.getBaseDilations() ? op.getBaseDilations() : nullptr,
+        op.getWindowDilations() ? op.getWindowDilations() : nullptr,
+        op.getPadding() ? op.getPadding() : nullptr);
+
+    rewriter.inlineRegionBefore(op.getRegion(), hi_op.getRegion(), hi_op.getRegion().end());
+    if (failed(rewriter.convertRegionTypes(&hi_op.getRegion(), *getTypeConverter())))
+      return failure();
+
+    auto lo_op = rewriter.create<stablehlo::ReduceWindowOp>(
+        loc, partType, lo_operand, lo_init,
+        op.getWindowDimensions(), op.getWindowStrides(),
+        op.getBaseDilations() ? op.getBaseDilations() : nullptr,
+        op.getWindowDilations() ? op.getWindowDilations() : nullptr,
+        op.getPadding() ? op.getPadding() : nullptr);
+
+    rewriter.cloneRegionBefore(hi_op.getRegion(), lo_op.getRegion(), lo_op.getRegion().end());
+
+    Value packed = packLimbs(hi_op.getResult(0), lo_op.getResult(0), rewriter, loc, concatDimension);
+    rewriter.replaceOp(op, packed);
+    return success();
+  }
+};
+
+struct BroadcastInDimOpConversion : public OpConversionPattern<stablehlo::BroadcastInDimOp> {
   StringRef concatDimension;
 
   BroadcastInDimOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
@@ -885,7 +1090,26 @@ struct MultiFloatConversionPass
     target.addDynamicallyLegalOp<stablehlo::SelectOp>([&](stablehlo::SelectOp op) {
       return typeConverter.isLegal(op.getType());
     });
+    target.addDynamicallyLegalOp<stablehlo::ReverseOp>([&](stablehlo::ReverseOp op) {
+      return typeConverter.isLegal(op.getType());
+    });
+    target.addDynamicallyLegalOp<stablehlo::AbsOp>([&](stablehlo::AbsOp op) {
+      return typeConverter.isLegal(op.getType());
+    });
+    target.addDynamicallyLegalOp<stablehlo::SqrtOp>([&](stablehlo::SqrtOp op) {
+      return typeConverter.isLegal(op.getType());
+    });
     target.addDynamicallyLegalOp<stablehlo::PadOp>([&](stablehlo::PadOp op) {
+      return typeConverter.isLegal(op.getType());
+    });
+    target.addDynamicallyLegalOp<stablehlo::WhileOp>([&](stablehlo::WhileOp op) {
+      return typeConverter.isLegal(op.getOperandTypes()) &&
+             typeConverter.isLegal(op.getResultTypes());
+    });
+    target.addDynamicallyLegalOp<stablehlo::ReturnOp>([&](stablehlo::ReturnOp op) {
+      return typeConverter.isLegal(op.getOperandTypes());
+    });
+    target.addDynamicallyLegalOp<stablehlo::ReduceWindowOp>([&](stablehlo::ReduceWindowOp op) {
       return typeConverter.isLegal(op.getType());
     });
 
@@ -895,12 +1119,18 @@ struct MultiFloatConversionPass
     patterns.add<MulOpConversion>(typeConverter, context, concatDimension);
     patterns.add<DivOpConversion>(typeConverter, context, concatDimension);
     patterns.add<SelectOpConversion>(typeConverter, context, concatDimension);
+    patterns.add<ReverseOpConversion>(typeConverter, context, concatDimension);
+    patterns.add<AbsOpConversion>(typeConverter, context, concatDimension);
+    patterns.add<SqrtOpConversion>(typeConverter, context, concatDimension);
     patterns.add<SliceOpConversion>(typeConverter, context, concatDimension);
     patterns.add<BroadcastInDimOpConversion>(typeConverter, context, concatDimension);
     patterns.add<TransposeOpConversion>(typeConverter, context, concatDimension);
     patterns.add<ReshapeOpConversion>(typeConverter, context, concatDimension);
     patterns.add<DotGeneralOpConversion>(typeConverter, context, concatDimension);
     patterns.add<PadOpConversion>(typeConverter, context, concatDimension);
+    patterns.add<WhileOpConversion>(typeConverter, context, concatDimension);
+    patterns.add<ReturnOpConversion>(typeConverter, context);
+    patterns.add<ReduceWindowOpConversion>(typeConverter, context, concatDimension);
     patterns.add<ConcatenateOpOptimization>(typeConverter, context);
     patterns.add<ConcatenateOpConversion>(typeConverter, context, concatDimension);
 

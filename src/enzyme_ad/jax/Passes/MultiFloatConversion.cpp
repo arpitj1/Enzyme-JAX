@@ -44,17 +44,46 @@ Type getFloatTypeFromString(StringRef typeStr, MLIRContext *context) {
 Value extractLimb(Value tensor, int limbIndex, OpBuilder &builder, Location loc, StringRef concatDimension) {
   bool isTuple = concatDimension == "tuple";
   bool isFirst = concatDimension == "first";
+  if (auto castOp = tensor.getDefiningOp<UnrealizedConversionCastOp>()) {
+    if (isTuple) {
+      if (castOp.getNumOperands() > 1)
+        return castOp.getOperand(limbIndex);
+    } else {
+      Value expanded = castOp.getOperand(0);
+      auto expandedType = dyn_cast<RankedTensorType>(expanded.getType());
+      auto resultType = dyn_cast<RankedTensorType>(tensor.getType());
+      if (expandedType && resultType && expandedType.getRank() > resultType.getRank()) {
+        SmallVector<int64_t> sliceShape = llvm::to_vector(expandedType.getShape());
+        int dimToSlice = isFirst ? 0 : expandedType.getRank() - 1;
+        sliceShape[dimToSlice] = 1;
+
+        SmallVector<int64_t> startIndices(expandedType.getRank(), 0);
+        SmallVector<int64_t> limitIndices = llvm::to_vector(expandedType.getShape());
+        startIndices[dimToSlice] = limbIndex;
+        limitIndices[dimToSlice] = limbIndex + 1;
+
+        SmallVector<int64_t> strides(expandedType.getRank(), 1);
+
+        return builder.create<stablehlo::SliceOp>(
+            loc, RankedTensorType::get(sliceShape, expandedType.getElementType()),
+            expanded, builder.getDenseI64ArrayAttr(startIndices),
+            builder.getDenseI64ArrayAttr(limitIndices),
+            builder.getDenseI64ArrayAttr(strides));
+      }
+    }
+  }
+
   if (isTuple) {
     if (auto tupleOp = tensor.getDefiningOp<stablehlo::TupleOp>()) {
       return tupleOp.getOperand(limbIndex);
     }
     return builder.create<stablehlo::GetTupleElementOp>(loc, tensor, builder.getI32IntegerAttr(limbIndex));
   }
-  
+
   if (auto concatOp = tensor.getDefiningOp<stablehlo::ConcatenateOp>()) {
     auto type = cast<RankedTensorType>(tensor.getType()); // use result type to get rank
     int concatDim = isFirst ? 0 : type.getRank() - 1;
-    if (concatOp.getDimension() == concatDim && concatOp.getOperands().size() == 2) {
+    if (concatOp.getDimension() == concatDim && concatOp.getOperands().size() == 2) { // TODO expansionSize
       return concatOp.getOperand(limbIndex);
     }
   }
@@ -217,6 +246,137 @@ struct GenericOpConversion : public OpConversionPattern<OpTy> {
     rewriter.replaceOp(op, newOp->getResults());
     return success();
 
+  }
+};
+
+struct ConstantOpConversion : public OpConversionPattern<stablehlo::ConstantOp> {
+  StringRef concatDimension;
+  int expansionSize;
+  Type sourceType;
+  Type targetType;
+
+  ConstantOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension, int expansionSize, Type sourceType, Type targetType)
+      : OpConversionPattern<stablehlo::ConstantOp>(typeConverter, context), concatDimension(concatDimension), expansionSize(expansionSize), sourceType(sourceType), targetType(targetType) {}
+
+  LogicalResult matchAndRewrite(stablehlo::ConstantOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto attr = op.getValue();
+
+    auto elementsAttr = dyn_cast<DenseElementsAttr>(attr);
+    if (!elementsAttr)
+      return failure();
+
+    Type elType = elementsAttr.getElementType();
+    if (elType != sourceType)
+      return failure();
+
+    auto outType = cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+
+    if (expansionSize == 1) {
+      if (elementsAttr.isSplat()) {
+        auto val = elementsAttr.getSplatValue<APFloat>();
+        bool losesInfo;
+        val.convert(cast<FloatType>(targetType).getFloatSemantics(), APFloat::rmNearestTiesToEven, &losesInfo);
+        auto newAttr = SplatElementsAttr::get(outType, val);
+        rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, newAttr);
+        return success();
+      } else {
+        SmallVector<Attribute> convertedAttrs;
+        for (auto val : elementsAttr.getValues<APFloat>()) {
+          bool losesInfo;
+          APFloat newVal = val;
+          newVal.convert(cast<FloatType>(targetType).getFloatSemantics(), APFloat::rmNearestTiesToEven, &losesInfo);
+          convertedAttrs.push_back(rewriter.getFloatAttr(targetType, newVal.convertToDouble()));
+        }
+        auto newAttr = DenseElementsAttr::get(outType, convertedAttrs);
+        rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, newAttr);
+        return success();
+      }
+    } else if (expansionSize == 2) {
+      if (concatDimension == "tuple") {
+        auto tupleType = cast<TupleType>(getTypeConverter()->convertType(op.getType()));
+        auto limbType = cast<RankedTensorType>(tupleType.getType(0));
+
+        if (elementsAttr.isSplat()) {
+          auto val = elementsAttr.getSplatValue<APFloat>();
+          double dval = val.convertToDouble();
+          float hi = (float)dval;
+          float lo = (float)(dval - hi);
+
+          APFloat hiAP(hi);
+          APFloat loAP(lo);
+
+          auto hiAttr = SplatElementsAttr::get(limbType, hiAP);
+          auto loAttr = SplatElementsAttr::get(limbType, loAP);
+
+          Value hiConst = rewriter.create<stablehlo::ConstantOp>(loc, hiAttr);
+          Value loConst = rewriter.create<stablehlo::ConstantOp>(loc, loAttr);
+
+          rewriter.replaceOpWithNewOp<stablehlo::TupleOp>(op, ValueRange{hiConst, loConst});
+          return success();
+        } else {
+          SmallVector<Attribute> hiAttrs;
+          SmallVector<Attribute> loAttrs;
+          for (auto val : elementsAttr.getValues<APFloat>()) {
+            double dval = val.convertToDouble();
+            float hi = (float)dval;
+            float lo = (float)(dval - hi);
+            hiAttrs.push_back(rewriter.getFloatAttr(targetType, hi));
+            loAttrs.push_back(rewriter.getFloatAttr(targetType, lo));
+          }
+          auto hiAttr = DenseElementsAttr::get(limbType, hiAttrs);
+          auto loAttr = DenseElementsAttr::get(limbType, loAttrs);
+
+          Value hiConst = rewriter.create<stablehlo::ConstantOp>(loc, hiAttr);
+          Value loConst = rewriter.create<stablehlo::ConstantOp>(loc, loAttr);
+
+          rewriter.replaceOpWithNewOp<stablehlo::TupleOp>(op, ValueRange{hiConst, loConst});
+          return success();
+        }
+      } else if (concatDimension == "first") {
+        if (elementsAttr.isSplat()) {
+            // Splat in "first" mode means all elements in both hi and lo are same?
+            // No, the expanded tensor has shape [2, ...].
+            // If it's a splat, then ALL elements in the expanded tensor are the SAME!
+            // But we want hi for first row and lo for second row!
+            // So it CANNOT be a splat in the new tensor if hi != lo!
+            // We must create a DenseElementsAttr (non-splat) with shape [2, ...].
+            auto val = elementsAttr.getSplatValue<APFloat>();
+            double dval = val.convertToDouble();
+            float hi = (float)dval;
+            float lo = (float)(dval - hi);
+
+            int64_t numElems = 1;
+            for (auto dim : elementsAttr.getType().getShape()) numElems *= dim;
+
+            SmallVector<Attribute> vals;
+            for (int64_t i = 0; i < numElems; ++i) vals.push_back(rewriter.getFloatAttr(targetType, hi));
+            for (int64_t i = 0; i < numElems; ++i) vals.push_back(rewriter.getFloatAttr(targetType, lo));
+
+            auto newAttr = DenseElementsAttr::get(outType, vals);
+            rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, newAttr);
+            return success();
+        } else {
+            SmallVector<Attribute> vals;
+            for (auto val : elementsAttr.getValues<APFloat>()) {
+              double dval = val.convertToDouble();
+              float hi = (float)dval;
+              vals.push_back(rewriter.getFloatAttr(targetType, hi));
+            }
+            for (auto val : elementsAttr.getValues<APFloat>()) {
+              double dval = val.convertToDouble();
+              float hi = (float)dval;
+              float lo = (float)(dval - hi);
+              vals.push_back(rewriter.getFloatAttr(targetType, lo));
+            }
+            auto newAttr = DenseElementsAttr::get(outType, vals);
+            rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, newAttr);
+            return success();
+        }
+      }
+    }
+    return failure();
   }
 };
 
@@ -736,6 +896,7 @@ struct WhileOpConversion : public OpConversionPattern<stablehlo::WhileOp> {
 
   LogicalResult matchAndRewrite(stablehlo::WhileOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
+    llvm::errs() << "WhileOpConversion called\n";
     Location loc = op.getLoc();
 
     bool isTuple = concatDimension == "tuple";
@@ -1593,6 +1754,10 @@ struct MultiFloatConversionPass
     IsResultOrOperandTypeLegal<stablehlo::TransposeOp> transposeLegal(typeConverter);
     IsResultOrOperandTypeLegal<stablehlo::ReshapeOp> reshapeLegal(typeConverter);
 
+    target.addDynamicallyLegalOp<stablehlo::ConstantOp>([&](stablehlo::ConstantOp op) {
+      return typeConverter.isLegal(op.getType());
+    });
+
     target.addDynamicallyLegalOp<stablehlo::ConcatenateOp>([&](stablehlo::ConcatenateOp op) {
       if (op.getOperands().size() != 2) return true;
       Operation *lhsOp = op.getOperands()[0].getDefiningOp();
@@ -1649,6 +1814,7 @@ struct MultiFloatConversionPass
     target.addDynamicallyLegalOp<stablehlo::ReduceWindowOp>(reduceWindowLegal);
 
     RewritePatternSet patterns(context);
+    patterns.add<ConstantOpConversion>(typeConverter, context, concatDimension, expansionSize, srcTy, tgtTy);
     if (expansionSize >= 2) {
       patterns.add<LowerReduceWindowOp>(context, srcTy);
     }

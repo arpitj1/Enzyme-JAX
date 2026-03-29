@@ -117,6 +117,7 @@ def MultiFloatConversionPass : Pass<"multi-float-conversion"> {
     Option<"sourceType", "source-type", "std::string", "\"f64\"", "Source floating-point type (e.g., f64, f32)">,
     Option<"targetType", "target-type", "std::string", "\"f32\"", "Target floating-point type (e.g., f32, f16, bf16)">,
     Option<"concatDimension", "concat-dimension", "std::string", "\"first\"", "Dimension to concatenate ('first' or 'last')">,
+    Option<"convertSignatures", "convert-signatures", "bool", "false", "Whether to convert function signatures">,
   ];
 }
 

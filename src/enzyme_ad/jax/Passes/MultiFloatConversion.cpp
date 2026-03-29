@@ -253,7 +253,106 @@ struct SubOpConversion : public OpConversionPattern<stablehlo::SubtractOp> {
     rewriter.replaceOp(op, packed);
     return success();
   }
+};struct SliceOpConversion : public OpConversionPattern<stablehlo::SliceOp> {
+  StringRef concatDimension;
+
+  SliceOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::SliceOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(stablehlo::SliceOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    bool isTuple = concatDimension == "tuple";
+    bool isFirst = concatDimension == "first";
+
+    if (isTuple) {
+      Value high = extractLimb(adaptor.getOperands()[0], 0, rewriter, loc, concatDimension);
+      Value low = extractLimb(adaptor.getOperands()[0], 1, rewriter, loc, concatDimension);
+
+      auto sliceHigh = rewriter.create<stablehlo::SliceOp>(loc, high, op.getStartIndices(), op.getLimitIndices(), op.getStrides());
+      auto sliceLow = rewriter.create<stablehlo::SliceOp>(loc, low, op.getStartIndices(), op.getLimitIndices(), op.getStrides());
+
+      Value packed = packLimbs(sliceHigh, sliceLow, rewriter, loc, concatDimension);
+      rewriter.replaceOp(op, packed);
+      return success();
+    }
+
+    SmallVector<int64_t> startIndices = llvm::to_vector(op.getStartIndices());
+    SmallVector<int64_t> limitIndices = llvm::to_vector(op.getLimitIndices());
+    SmallVector<int64_t> strides = llvm::to_vector(op.getStrides());
+
+    if (isFirst) {
+      startIndices.insert(startIndices.begin(), 0);
+      limitIndices.insert(limitIndices.begin(), 2);
+      strides.insert(strides.begin(), 1);
+    } else {
+      startIndices.push_back(0);
+      limitIndices.push_back(2);
+      strides.push_back(1);
+    }
+
+    auto outType = cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+
+    auto sliceOp = rewriter.create<stablehlo::SliceOp>(
+        loc, outType, adaptor.getOperands()[0],
+        rewriter.getDenseI64ArrayAttr(startIndices),
+        rewriter.getDenseI64ArrayAttr(limitIndices),
+        rewriter.getDenseI64ArrayAttr(strides));
+
+    rewriter.replaceOp(op, sliceOp);
+    return success();
+  }
+};struct BroadcastInDimOpConversion : public OpConversionPattern<stablehlo::BroadcastInDimOp> {
+  StringRef concatDimension;
+
+  BroadcastInDimOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::BroadcastInDimOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(stablehlo::BroadcastInDimOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    bool isTuple = concatDimension == "tuple";
+    bool isFirst = concatDimension == "first";
+
+    if (isTuple) {
+      Value high = extractLimb(adaptor.getOperands()[0], 0, rewriter, loc, concatDimension);
+      Value low = extractLimb(adaptor.getOperands()[0], 1, rewriter, loc, concatDimension);
+
+      auto outType = cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+      auto partType = cast<TupleType>(outType).getType(0);
+
+      auto bcastHigh = rewriter.create<stablehlo::BroadcastInDimOp>(loc, partType, high, op.getBroadcastDimensions());
+      auto bcastLow = rewriter.create<stablehlo::BroadcastInDimOp>(loc, partType, low, op.getBroadcastDimensions());
+
+      Value packed = packLimbs(bcastHigh, bcastLow, rewriter, loc, concatDimension);
+      rewriter.replaceOp(op, packed);
+      return success();
+    }
+
+    SmallVector<int64_t> broadcastDims = llvm::to_vector(op.getBroadcastDimensions());
+    auto outType = cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+    
+    if (isFirst) {
+      SmallVector<int64_t> newBroadcastDims;
+      newBroadcastDims.push_back(0);
+      for (auto dim : broadcastDims) {
+        newBroadcastDims.push_back(dim + 1);
+      }
+      broadcastDims = std::move(newBroadcastDims);
+    } else {
+      broadcastDims.push_back(outType.getRank() - 1);
+    }
+
+    auto bcastOp = rewriter.create<stablehlo::BroadcastInDimOp>(
+        loc, outType, adaptor.getOperands()[0],
+        rewriter.getDenseI64ArrayAttr(broadcastDims));
+
+    rewriter.replaceOp(op, bcastOp);
+    return success();
+  }
 };
+
+
 
 struct ConcatenateOpOptimization : public OpConversionPattern<stablehlo::ConcatenateOp> {
   using OpConversionPattern<stablehlo::ConcatenateOp>::OpConversionPattern;
@@ -381,6 +480,17 @@ struct MultiFloatConversionPass
       if (lhsOp->getAttrDictionary() != rhsOp->getAttrDictionary()) return true;
       return false; // Not legal if it can be optimized!
     });
+    target.addDynamicallyLegalOp<stablehlo::SliceOp>([&](stablehlo::SliceOp op) {
+      if (typeConverter.isLegal(op.getType())) return true; // Already legal if its output is legal (meaning it was probably generated by us or is already in the right shape)
+      // But wait! If it's are slice of are multi-float tensor, it should be converted!
+      // If it's are slice of are standard tensor, it's legal!
+      // So it's legal if its INPUT is legal!
+      return typeConverter.isLegal(op.getOperand().getType());
+    });
+    target.addDynamicallyLegalOp<stablehlo::BroadcastInDimOp>([&](stablehlo::BroadcastInDimOp op) {
+      if (typeConverter.isLegal(op.getType())) return true;
+      return typeConverter.isLegal(op.getOperand().getType());
+    });
     target.addDynamicallyLegalOp<stablehlo::AddOp>([&](stablehlo::AddOp op) {
       return typeConverter.isLegal(op.getType());
     });
@@ -395,6 +505,8 @@ struct MultiFloatConversionPass
     patterns.add<AddOpConversion>(typeConverter, context, concatDimension);
     patterns.add<SubOpConversion>(typeConverter, context, concatDimension);
     patterns.add<MulOpConversion>(typeConverter, context, concatDimension);
+    patterns.add<SliceOpConversion>(typeConverter, context, concatDimension);
+    patterns.add<BroadcastInDimOpConversion>(typeConverter, context, concatDimension);
     patterns.add<ConcatenateOpOptimization>(typeConverter, context);
 
 

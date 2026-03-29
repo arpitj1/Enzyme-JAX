@@ -567,16 +567,16 @@ struct ReduceWindowOpConversion : public OpConversionPattern<stablehlo::ReduceWi
     Value hi_init = extractLimb(initValue, 0, rewriter, loc, concatDimension);
     Value lo_init = extractLimb(initValue, 1, rewriter, loc, concatDimension);
 
-    auto outType = cast<RankedTensorType>(op.getType());
+    auto outType = cast<RankedTensorType>(op.getResults()[0].getType());
     auto f32Type = rewriter.getF32Type();
     auto partType = RankedTensorType::get(outType.getShape(), f32Type);
 
     auto hi_op = rewriter.create<stablehlo::ReduceWindowOp>(
         loc, partType, hi_operand, hi_init,
-        op.getWindowDimensions(), op.getWindowStrides(),
-        op.getBaseDilations() ? op.getBaseDilations() : nullptr,
-        op.getWindowDilations() ? op.getWindowDilations() : nullptr,
-        op.getPadding() ? op.getPadding() : nullptr);
+        op.getWindowDimensions(), op.getWindowStridesAttr() ? op.getWindowStridesAttr() : nullptr,
+        op.getBaseDilationsAttr() ? op.getBaseDilationsAttr() : nullptr,
+        op.getWindowDilationsAttr() ? op.getWindowDilationsAttr() : nullptr,
+        op.getPaddingAttr() ? op.getPaddingAttr() : nullptr);
 
     rewriter.inlineRegionBefore(op.getRegion(), hi_op.getRegion(), hi_op.getRegion().end());
     if (failed(rewriter.convertRegionTypes(&hi_op.getRegion(), *getTypeConverter())))
@@ -584,10 +584,10 @@ struct ReduceWindowOpConversion : public OpConversionPattern<stablehlo::ReduceWi
 
     auto lo_op = rewriter.create<stablehlo::ReduceWindowOp>(
         loc, partType, lo_operand, lo_init,
-        op.getWindowDimensions(), op.getWindowStrides(),
-        op.getBaseDilations() ? op.getBaseDilations() : nullptr,
-        op.getWindowDilations() ? op.getWindowDilations() : nullptr,
-        op.getPadding() ? op.getPadding() : nullptr);
+        op.getWindowDimensions(), op.getWindowStridesAttr() ? op.getWindowStridesAttr() : nullptr,
+        op.getBaseDilationsAttr() ? op.getBaseDilationsAttr() : nullptr,
+        op.getWindowDilationsAttr() ? op.getWindowDilationsAttr() : nullptr,
+        op.getPaddingAttr() ? op.getPaddingAttr() : nullptr);
 
     rewriter.cloneRegionBefore(hi_op.getRegion(), lo_op.getRegion(), lo_op.getRegion().end());
 
@@ -980,6 +980,38 @@ struct PadOpConversion : public OpConversionPattern<stablehlo::PadOp> {
   }
 };
 
+template <typename OpTy>
+struct IsResultTypeLegal {
+  const TypeConverter &typeConverter;
+  IsResultTypeLegal(const TypeConverter &tc) : typeConverter(tc) {}
+
+  bool operator()(OpTy op) const {
+    return typeConverter.isLegal(op.getType());
+  }
+};
+
+template <>
+struct IsResultTypeLegal<stablehlo::ReduceWindowOp> {
+  const TypeConverter &typeConverter;
+  IsResultTypeLegal(const TypeConverter &tc) : typeConverter(tc) {}
+
+  bool operator()(stablehlo::ReduceWindowOp op) const {
+    if (op.getResults().empty()) return true;
+    return typeConverter.isLegal(op.getResults()[0].getType());
+  }
+};
+
+template <typename OpTy>
+struct IsResultOrOperandTypeLegal {
+  const TypeConverter &typeConverter;
+  IsResultOrOperandTypeLegal(const TypeConverter &tc) : typeConverter(tc) {}
+
+  bool operator()(OpTy op) const {
+    if (typeConverter.isLegal(op.getType())) return true;
+    return typeConverter.isLegal(op.getOperand().getType());
+  }
+};
+
 struct MultiFloatConversionPass
     : public enzyme::impl::MultiFloatConversionPassBase<MultiFloatConversionPass> {
   using MultiFloatConversionPassBase::MultiFloatConversionPassBase;
@@ -1047,6 +1079,23 @@ struct MultiFloatConversionPass
     });
 
     target.addLegalOp<UnrealizedConversionCastOp>();
+
+    IsResultTypeLegal<stablehlo::AddOp> addLegal(typeConverter);
+    IsResultTypeLegal<stablehlo::SubtractOp> subLegal(typeConverter);
+    IsResultTypeLegal<stablehlo::MulOp> mulLegal(typeConverter);
+    IsResultTypeLegal<stablehlo::DivOp> divLegal(typeConverter);
+    IsResultTypeLegal<stablehlo::SelectOp> selectLegal(typeConverter);
+    IsResultTypeLegal<stablehlo::ReverseOp> reverseLegal(typeConverter);
+    IsResultTypeLegal<stablehlo::AbsOp> absLegal(typeConverter);
+    IsResultTypeLegal<stablehlo::SqrtOp> sqrtLegal(typeConverter);
+    IsResultTypeLegal<stablehlo::PadOp> padLegal(typeConverter);
+    IsResultTypeLegal<stablehlo::ReduceWindowOp> reduceWindowLegal(typeConverter);
+
+    IsResultOrOperandTypeLegal<stablehlo::SliceOp> sliceLegal(typeConverter);
+    IsResultOrOperandTypeLegal<stablehlo::BroadcastInDimOp> broadcastLegal(typeConverter);
+    IsResultOrOperandTypeLegal<stablehlo::TransposeOp> transposeLegal(typeConverter);
+    IsResultOrOperandTypeLegal<stablehlo::ReshapeOp> reshapeLegal(typeConverter);
+
     target.addDynamicallyLegalOp<stablehlo::ConcatenateOp>([&](stablehlo::ConcatenateOp op) {
       if (op.getOperands().size() != 2) return true;
       Operation *lhsOp = op.getOperands()[0].getDefiningOp();
@@ -1057,52 +1106,19 @@ struct MultiFloatConversionPass
       if (lhsOp->getAttrDictionary() != rhsOp->getAttrDictionary()) return true;
       return false; // Not legal if it can be optimized!
     });
-    target.addDynamicallyLegalOp<stablehlo::SliceOp>([&](stablehlo::SliceOp op) {
-      if (typeConverter.isLegal(op.getType())) return true; // Already legal if its output is legal (meaning it was probably generated by us or is already in the right shape)
-      // But wait! If it's are slice of are multi-float tensor, it should be converted!
-      // If it's are slice of are standard tensor, it's legal!
-      // So it's legal if its INPUT is legal!
-      return typeConverter.isLegal(op.getOperand().getType());
-    });
-    target.addDynamicallyLegalOp<stablehlo::BroadcastInDimOp>([&](stablehlo::BroadcastInDimOp op) {
-      if (typeConverter.isLegal(op.getType())) return true;
-      return typeConverter.isLegal(op.getOperand().getType());
-    });
-    target.addDynamicallyLegalOp<stablehlo::TransposeOp>([&](stablehlo::TransposeOp op) {
-      if (typeConverter.isLegal(op.getType())) return true;
-      return typeConverter.isLegal(op.getOperand().getType());
-    });
-    target.addDynamicallyLegalOp<stablehlo::ReshapeOp>([&](stablehlo::ReshapeOp op) {
-      if (typeConverter.isLegal(op.getType())) return true;
-      return typeConverter.isLegal(op.getOperand().getType());
-    });
-    target.addDynamicallyLegalOp<stablehlo::AddOp>([&](stablehlo::AddOp op) {
-      return typeConverter.isLegal(op.getType());
-    });
-    target.addDynamicallyLegalOp<stablehlo::SubtractOp>([&](stablehlo::SubtractOp op) {
-      return typeConverter.isLegal(op.getType());
-    });
-    target.addDynamicallyLegalOp<stablehlo::MulOp>([&](stablehlo::MulOp op) {
-      return typeConverter.isLegal(op.getType());
-    });
-    target.addDynamicallyLegalOp<stablehlo::DivOp>([&](stablehlo::DivOp op) {
-      return typeConverter.isLegal(op.getType());
-    });
-    target.addDynamicallyLegalOp<stablehlo::SelectOp>([&](stablehlo::SelectOp op) {
-      return typeConverter.isLegal(op.getType());
-    });
-    target.addDynamicallyLegalOp<stablehlo::ReverseOp>([&](stablehlo::ReverseOp op) {
-      return typeConverter.isLegal(op.getType());
-    });
-    target.addDynamicallyLegalOp<stablehlo::AbsOp>([&](stablehlo::AbsOp op) {
-      return typeConverter.isLegal(op.getType());
-    });
-    target.addDynamicallyLegalOp<stablehlo::SqrtOp>([&](stablehlo::SqrtOp op) {
-      return typeConverter.isLegal(op.getType());
-    });
-    target.addDynamicallyLegalOp<stablehlo::PadOp>([&](stablehlo::PadOp op) {
-      return typeConverter.isLegal(op.getType());
-    });
+    target.addDynamicallyLegalOp<stablehlo::SliceOp>(sliceLegal);
+    target.addDynamicallyLegalOp<stablehlo::BroadcastInDimOp>(broadcastLegal);
+    target.addDynamicallyLegalOp<stablehlo::TransposeOp>(transposeLegal);
+    target.addDynamicallyLegalOp<stablehlo::ReshapeOp>(reshapeLegal);
+    target.addDynamicallyLegalOp<stablehlo::AddOp>(addLegal);
+    target.addDynamicallyLegalOp<stablehlo::SubtractOp>(subLegal);
+    target.addDynamicallyLegalOp<stablehlo::MulOp>(mulLegal);
+    target.addDynamicallyLegalOp<stablehlo::DivOp>(divLegal);
+    target.addDynamicallyLegalOp<stablehlo::SelectOp>(selectLegal);
+    target.addDynamicallyLegalOp<stablehlo::ReverseOp>(reverseLegal);
+    target.addDynamicallyLegalOp<stablehlo::AbsOp>(absLegal);
+    target.addDynamicallyLegalOp<stablehlo::SqrtOp>(sqrtLegal);
+    target.addDynamicallyLegalOp<stablehlo::PadOp>(padLegal);
     target.addDynamicallyLegalOp<stablehlo::WhileOp>([&](stablehlo::WhileOp op) {
       return typeConverter.isLegal(op.getOperandTypes()) &&
              typeConverter.isLegal(op.getResultTypes());
@@ -1110,9 +1126,7 @@ struct MultiFloatConversionPass
     target.addDynamicallyLegalOp<stablehlo::ReturnOp>([&](stablehlo::ReturnOp op) {
       return typeConverter.isLegal(op.getOperandTypes());
     });
-    target.addDynamicallyLegalOp<stablehlo::ReduceWindowOp>([&](stablehlo::ReduceWindowOp op) {
-      return typeConverter.isLegal(op.getType());
-    });
+    target.addDynamicallyLegalOp<stablehlo::ReduceWindowOp>(reduceWindowLegal);
 
     RewritePatternSet patterns(context);
     patterns.add<AddOpConversion>(typeConverter, context, concatDimension);

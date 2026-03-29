@@ -510,19 +510,38 @@ struct WhileOpConversion : public OpConversionPattern<stablehlo::WhileOp> {
                                 ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
 
-    SmallVector<Type> convertedTypes;
-    if (failed(getTypeConverter()->convertTypes(op.getOperandTypes(), convertedTypes)))
-      return failure();
+    bool isTuple = concatDimension == "tuple";
+    SmallVector<Type> flatConvertedTypes;
+    SmallVector<Value> flatOperands;
 
-    auto newWhileOp = rewriter.create<stablehlo::WhileOp>(loc, convertedTypes, adaptor.getOperands());
+    TypeConverter::SignatureConversion signatureConversion(op.getNumOperands());
+
+    for (unsigned i = 0; i < adaptor.getOperands().size(); ++i) {
+      Value operand = adaptor.getOperands()[i];
+      Type type = getTypeConverter()->convertType(op.getOperandTypes()[i]);
+      if (isTuple && dyn_cast<TupleType>(type)) {
+        auto tupleTy = cast<TupleType>(type);
+        flatConvertedTypes.push_back(tupleTy.getType(0));
+        flatConvertedTypes.push_back(tupleTy.getType(1));
+        flatOperands.push_back(rewriter.create<stablehlo::GetTupleElementOp>(loc, operand, 0));
+        flatOperands.push_back(rewriter.create<stablehlo::GetTupleElementOp>(loc, operand, 1));
+        signatureConversion.addInputs(i, {tupleTy.getType(0), tupleTy.getType(1)});
+      } else {
+        flatConvertedTypes.push_back(type);
+        flatOperands.push_back(operand);
+        signatureConversion.addInputs(i, type);
+      }
+    }
+
+    auto newWhileOp = rewriter.create<stablehlo::WhileOp>(loc, flatConvertedTypes, flatOperands);
     newWhileOp.getOperation()->setAttrs(op.getOperation()->getAttrs());
 
     rewriter.inlineRegionBefore(op.getCond(), newWhileOp.getCond(), newWhileOp.getCond().end());
-    if (failed(rewriter.convertRegionTypes(&newWhileOp.getCond(), *getTypeConverter())))
+    if (failed(rewriter.convertRegionTypes(&newWhileOp.getCond(), *getTypeConverter(), &signatureConversion)))
       return failure();
 
     rewriter.inlineRegionBefore(op.getBody(), newWhileOp.getBody(), newWhileOp.getBody().end());
-    if (failed(rewriter.convertRegionTypes(&newWhileOp.getBody(), *getTypeConverter())))
+    if (failed(rewriter.convertRegionTypes(&newWhileOp.getBody(), *getTypeConverter(), &signatureConversion)))
       return failure();
 
     rewriter.replaceOp(op, newWhileOp.getResults());
@@ -536,8 +555,15 @@ struct ReturnOpConversion : public OpConversionPattern<stablehlo::ReturnOp> {
   LogicalResult matchAndRewrite(stablehlo::ReturnOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
     SmallVector<Value> convertedOperands;
+    // We check if any operand is TupleType and flatten it!
+    // Since we only want to flatten TupleType which we created (tgtTy, tgtTy), we can check types!
     for (auto operand : adaptor.getOperands()) {
-      convertedOperands.push_back(operand);
+      if (dyn_cast<TupleType>(operand.getType())) { // In tuple mode, we assume any TupleType is our double-precision emulation
+        convertedOperands.push_back(rewriter.create<stablehlo::GetTupleElementOp>(op.getLoc(), operand, 0));
+        convertedOperands.push_back(rewriter.create<stablehlo::GetTupleElementOp>(op.getLoc(), operand, 1));
+      } else {
+        convertedOperands.push_back(operand);
+      }
     }
     rewriter.replaceOpWithNewOp<stablehlo::ReturnOp>(op, convertedOperands);
     return success();
@@ -1070,12 +1096,14 @@ struct MultiFloatConversionPass
     });
     
     typeConverter.addSourceMaterialization([](OpBuilder &builder, Type type, ValueRange inputs, Location loc) -> Value {
-      if (inputs.size() != 1) return Value();
-      return builder.create<UnrealizedConversionCastOp>(loc, type, inputs[0]).getResult(0);
+      if (inputs.size() == 1)
+        return builder.create<UnrealizedConversionCastOp>(loc, type, inputs[0]).getResult(0);
+      return builder.create<UnrealizedConversionCastOp>(loc, type, inputs).getResult(0);
     });
     typeConverter.addTargetMaterialization([](OpBuilder &builder, Type type, ValueRange inputs, Location loc) -> Value {
-      if (inputs.size() != 1) return Value();
-      return builder.create<UnrealizedConversionCastOp>(loc, type, inputs[0]).getResult(0);
+      if (inputs.size() == 1)
+        return builder.create<UnrealizedConversionCastOp>(loc, type, inputs[0]).getResult(0);
+      return builder.create<UnrealizedConversionCastOp>(loc, type, inputs).getResult(0);
     });
 
     target.addLegalOp<UnrealizedConversionCastOp>();

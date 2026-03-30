@@ -2075,33 +2075,36 @@ struct LowerReduceWindowOp : public OpConversionPattern<stablehlo::ReduceWindowO
     if (packingResults.size() == 1) {
       finalResult = packingResults[0];
     } else {
-      SmallVector<Value> reshapedPackingResults;
-      for (Value res : packingResults) {
-        SmallVector<int64_t> reshapedShape = {1};
-        for (int64_t s : cast<RankedTensorType>(res.getType()).getShape()) {
-          reshapedShape.push_back(s);
+      if (hasPacking) {
+        SmallVector<int64_t> concatShape = llvm::to_vector(mlir::cast<RankedTensorType>(packingResults[0].getType()).getShape());
+        concatShape[0] = packingSize;
+        
+        finalResult = rewriter.create<stablehlo::ConcatenateOp>(
+            loc, RankedTensorType::get(concatShape, mlir::cast<RankedTensorType>(packingResults[0].getType()).getElementType()),
+            packingResults, 0);
+      } else {
+        SmallVector<Value> reshapedPackingResults;
+        for (Value res : packingResults) {
+          SmallVector<int64_t> reshapedShape = {1};
+          for (int64_t s : mlir::cast<RankedTensorType>(res.getType()).getShape()) {
+            reshapedShape.push_back(s);
+          }
+          reshapedPackingResults.push_back(rewriter.create<stablehlo::ReshapeOp>(
+              loc, RankedTensorType::get(reshapedShape, mlir::cast<RankedTensorType>(res.getType()).getElementType()), res));
         }
-        llvm::outs() << "Reshaping packing result of type: " << res.getType() << "\n";
-        reshapedPackingResults.push_back(rewriter.create<stablehlo::ReshapeOp>(
-            loc, RankedTensorType::get(reshapedShape, cast<RankedTensorType>(res.getType()).getElementType()), res));
+        
+        SmallVector<int64_t> concatShape = {packingSize};
+        for (int64_t s : mlir::cast<RankedTensorType>(packingResults[0].getType()).getShape()) {
+          concatShape.push_back(s);
+        }
+        
+        finalResult = rewriter.create<stablehlo::ConcatenateOp>(
+            loc, RankedTensorType::get(concatShape, mlir::cast<RankedTensorType>(packingResults[0].getType()).getElementType()),
+            reshapedPackingResults, 0);
       }
-      
-      SmallVector<int64_t> concatShape = {packingSize};
-      for (int64_t s : cast<RankedTensorType>(packingResults[0].getType()).getShape()) {
-        concatShape.push_back(s);
-      }
-      
-      llvm::outs() << "Final concat result type specified: " << RankedTensorType::get(concatShape, cast<RankedTensorType>(packingResults[0].getType()).getElementType()) << "\n";
-      for (Value res : reshapedPackingResults) {
-        llvm::outs() << "Final concat operand type: " << res.getType() << "\n";
-      }
-      
-      finalResult = rewriter.create<stablehlo::ConcatenateOp>(
-          loc, RankedTensorType::get(concatShape, cast<RankedTensorType>(packingResults[0].getType()).getElementType()),
-          reshapedPackingResults, 0);
     }
 
-    if (outRank < newRank && !hasPacking) {
+    if (outRank < newRank) {
       finalResult = rewriter.create<stablehlo::ReshapeOp>(loc, outType, finalResult);
     }
 

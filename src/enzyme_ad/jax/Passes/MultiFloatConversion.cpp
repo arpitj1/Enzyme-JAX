@@ -368,30 +368,41 @@ struct ConstantOpConversion : public OpConversionPattern<stablehlo::ConstantOp> 
           rewriter.replaceOpWithNewOp<stablehlo::TupleOp>(op, ValueRange{hiConst, loConst});
           return success();
         }
-      } else if (concatDimension == "first") {
+      } else if (concatDimension == "first" || concatDimension == "last") {
         if (elementsAttr.isSplat()) {
-            // Splat in "first" mode means all elements in both hi and lo are same?
-            // No, the expanded tensor has shape [2, ...].
-            // If it's a splat, then ALL elements in the expanded tensor are the SAME!
-            // But we want hi for first row and lo for second row!
-            // So it CANNOT be a splat in the new tensor if hi != lo!
-            // We must create a DenseElementsAttr (non-splat) with shape [2, ...].
             auto val = elementsAttr.getSplatValue<APFloat>();
-            double dval = val.convertToDouble();
-            float hi = (float)dval;
-            float lo = (float)(dval - hi);
+            APFloat hiAP = val;
+            bool losesInfo;
+            hiAP.convert(cast<FloatType>(targetType).getFloatSemantics(), APFloat::rmNearestTiesToEven, &losesInfo);
 
-            int64_t numElems = 1;
-            for (auto dim : elementsAttr.getType().getShape()) numElems *= dim;
+            APFloat hiSource = hiAP;
+            hiSource.convert(cast<FloatType>(sourceType).getFloatSemantics(), APFloat::rmNearestTiesToEven, &losesInfo);
 
-            SmallVector<Attribute> vals;
-            for (int64_t i = 0; i < numElems; ++i) vals.push_back(rewriter.getFloatAttr(targetType, hi));
-            for (int64_t i = 0; i < numElems; ++i) vals.push_back(rewriter.getFloatAttr(targetType, lo));
+            APFloat loSource = val;
+            loSource.subtract(hiSource, APFloat::rmNearestTiesToEven);
 
-            auto newAttr = DenseElementsAttr::get(outType, vals);
-            rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, newAttr);
+            APFloat loAP = loSource;
+            loAP.convert(cast<FloatType>(targetType).getFloatSemantics(), APFloat::rmNearestTiesToEven, &losesInfo);
+
+            SmallVector<int64_t> limbShape;
+            if (concatDimension == "first") {
+                limbShape.push_back(1);
+                for (auto dim : elementsAttr.getType().getShape()) limbShape.push_back(dim);
+            } else {
+                for (auto dim : elementsAttr.getType().getShape()) limbShape.push_back(dim);
+                limbShape.push_back(1);
+            }
+            auto limbType = RankedTensorType::get(limbShape, targetType);
+            auto hiAttr = SplatElementsAttr::get(limbType, hiAP);
+            auto loAttr = SplatElementsAttr::get(limbType, loAP);
+
+            Value hiConst = rewriter.create<stablehlo::ConstantOp>(loc, hiAttr);
+            Value loConst = rewriter.create<stablehlo::ConstantOp>(loc, loAttr);
+
+            Value packed = packLimbs({hiConst, loConst}, rewriter, loc, concatDimension);
+            rewriter.replaceOp(op, packed);
             return success();
-        } else {
+        } else if (concatDimension == "first") {
             SmallVector<Attribute> vals;
             for (auto val : elementsAttr.getValues<APFloat>()) {
               double dval = val.convertToDouble();
@@ -407,6 +418,8 @@ struct ConstantOpConversion : public OpConversionPattern<stablehlo::ConstantOp> 
             auto newAttr = DenseElementsAttr::get(outType, vals);
             rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, newAttr);
             return success();
+        } else {
+            return failure();
         }
       }
     }
@@ -609,6 +622,7 @@ struct ConvertOpConversion : public OpConversionPattern<stablehlo::ConvertOp> {
 
   LogicalResult matchAndRewrite(stablehlo::ConvertOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
+    llvm::errs() << "ConvertOpConversion called\n";
     Location loc = op.getLoc();
     Type outType = op.getResult().getType();
     Type inType = op.getOperand().getType();
@@ -1354,6 +1368,7 @@ struct DotGeneralOpConversion : public OpConversionPattern<stablehlo::DotGeneral
 
   LogicalResult matchAndRewrite(stablehlo::DotGeneralOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
+    llvm::errs() << "DotGeneralOpConversion called\n";
     Location loc = op.getLoc();
     Value lhs = adaptor.getOperands()[0];
     Value rhs = adaptor.getOperands()[1];

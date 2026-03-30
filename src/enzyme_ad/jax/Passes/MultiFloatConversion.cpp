@@ -1018,44 +1018,27 @@ struct ReturnOpConversion : public OpConversionPattern<stablehlo::ReturnOp> {
 
   LogicalResult matchAndRewrite(stablehlo::ReturnOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
-    llvm::errs() << "ReturnOpConversion called\n";
     Location loc = op.getLoc();
     SmallVector<Value> newOperands;
 
-    llvm::errs() << "ReturnOp parent: " << op->getParentOp()->getName().getStringRef() << "\n";
     bool isFuncReturn = isa<func::FuncOp>(op->getParentOp());
 
     if (!isFuncReturn) {
       if (op->getParentOp()->getName().getStringRef() == "stablehlo.while") {
-        llvm::errs() << "ReturnOp inside WhileOp found\n";
         SmallVector<Value> flatOperands;
         if (concatDimension == "tuple") {
-          llvm::errs() << "Tuple mode handling\n";
           for (auto operand : adaptor.getOperands()) {
-            llvm::errs() << "Operand type: " << operand.getType() << "\n";
             Value hi = extractLimb(operand, 0, rewriter, loc, concatDimension);
             Value lo = extractLimb(operand, 1, rewriter, loc, concatDimension);
-            llvm::errs() << "Extracted hi type: " << hi.getType() << "\n";
             flatOperands.push_back(hi);
             flatOperands.push_back(lo);
-          }
-        } else if (concatDimension == "first") {
-          llvm::errs() << "First mode handling\n";
-          for (auto operand : adaptor.getOperands()) {
-            if (auto castOp = operand.getDefiningOp<UnrealizedConversionCastOp>()) {
-              flatOperands.push_back(castOp.getOperand(0));
-            } else {
-              flatOperands.push_back(operand);
-            }
           }
         } else {
           for (auto operand : adaptor.getOperands()) {
             flatOperands.push_back(operand);
           }
         }
-        llvm::errs() << "Flattened operands count: " << flatOperands.size() << "\n";
         rewriter.replaceOpWithNewOp<stablehlo::ReturnOp>(op, flatOperands);
-        llvm::errs() << "Replaced ReturnOp\n";
         return success();
       }
 
@@ -1613,18 +1596,23 @@ struct PadOpConversion : public OpConversionPattern<stablehlo::PadOp> {
   }
 };
 
-struct LowerReduceWindowOp : public RewritePattern {
+struct LowerReduceWindowOp : public OpConversionPattern<stablehlo::ReduceWindowOp> {
   Type sourceType;
+  StringRef concatDimension;
 
-  LowerReduceWindowOp(MLIRContext *context, Type sourceType)
-      : RewritePattern(stablehlo::ReduceWindowOp::getOperationName(), 1, context), sourceType(sourceType) {}
+  LowerReduceWindowOp(TypeConverter &typeConverter, MLIRContext *context, Type sourceType, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::ReduceWindowOp>(typeConverter, context), sourceType(sourceType), concatDimension(concatDimension) {}
 
-  LogicalResult matchAndRewrite(Operation *op, PatternRewriter &rewriter) const override {
-    auto reduceOp = cast<stablehlo::ReduceWindowOp>(op);
+  LogicalResult matchAndRewrite(stablehlo::ReduceWindowOp reduceOp, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Value input = adaptor.getInputs()[0];
+    auto tensorType = cast<RankedTensorType>(input.getType());
     
-    auto tensorType = cast<RankedTensorType>(reduceOp.getOperand(0).getType());
-    if (tensorType.getElementType() != sourceType) return failure();
-    
+    int origRank = reduceOp.getWindowDimensions().size();
+    int newRank = tensorType.getRank();
+    int rankDiff = newRank - origRank;
+
+    bool isFirst = concatDimension == "first";
     Region &region = reduceOp.getBody();
     if (region.getBlocks().size() != 1) return failure();
     Block &block = region.front();
@@ -1670,8 +1658,17 @@ struct LowerReduceWindowOp : public RewritePattern {
       highPadding.push_back(high);
     }
 
+    if (rankDiff > 0) {
+      if (isFirst) {
+        lowPadding.insert(lowPadding.begin(), 0);
+        highPadding.insert(highPadding.begin(), 0);
+      } else {
+        lowPadding.push_back(0);
+        highPadding.push_back(0);
+      }
+    }
+
     Location loc = reduceOp.getLoc();
-    Value input = reduceOp.getInputs()[0];
 
     bool needsPadding = false;
     for (auto p : lowPadding) if (p > 0) needsPadding = true;
@@ -1679,8 +1676,13 @@ struct LowerReduceWindowOp : public RewritePattern {
 
     Value paddedInput = input;
     if (needsPadding) {
-      Value initValue = reduceOp.getInitValues()[0];
-      SmallVector<int64_t> interiorPadding(dims.size(), 0);
+      Value initValues = adaptor.getInitValues()[0];
+      Value initValue = extractLimb(initValues, 0, rewriter, loc, concatDimension);
+
+      auto scalarType = RankedTensorType::get({}, cast<RankedTensorType>(initValue.getType()).getElementType());
+      initValue = rewriter.create<stablehlo::ReshapeOp>(loc, scalarType, initValue);
+
+      SmallVector<int64_t> interiorPadding(newRank, 0);
       paddedInput = rewriter.create<stablehlo::PadOp>(
           loc, input, initValue, 
           rewriter.getDenseI64ArrayAttr(lowPadding), 
@@ -1688,40 +1690,103 @@ struct LowerReduceWindowOp : public RewritePattern {
           rewriter.getDenseI64ArrayAttr(interiorPadding));
     }
 
-    auto outType = cast<RankedTensorType>(reduceOp.getResult(0).getType());
-    auto outShape = outType.getShape();
+    auto outType = getTypeConverter()->convertType(reduceOp.getResult(0).getType());
+    auto outTensorType = cast<RankedTensorType>(outType);
+    auto outShape = outTensorType.getShape();
+    int outRank = outTensorType.getRank();
 
-    SmallVector<Value> slices;
-    for (int64_t i = 0; i < windowSize; ++i) {
-      SmallVector<int64_t> startOffsets(dims.size(), 0);
-      startOffsets[reduceDim] = i;
-      SmallVector<int64_t> endOffsets;
-      for (size_t d = 0; d < dims.size(); ++d) {
-        if (d == reduceDim) {
-          endOffsets.push_back(i + outShape[d]);
-        } else {
-          endOffsets.push_back(outShape[d]);
+    bool hasPacking = (tensorType.getRank() == dims.size() + 1);
+    int packingSize = hasPacking ? tensorType.getShape()[0] : 1;
+    int actualReduceDim = reduceDim + (hasPacking ? 1 : 0);
+    bool outHasPacking = (outRank == dims.size() + 1);
+    int actualOutReduceDim = reduceDim + (outHasPacking ? 1 : 0);
+    int outSize = outShape[actualOutReduceDim];
+
+    SmallVector<Value> packingResults;
+    for (int p = 0; p < packingSize; ++p) {
+      SmallVector<Value> rollingResults;
+      for (int k = 0; k < outSize; ++k) {
+        SmallVector<Value> slices;
+        for (int i = 0; i < windowSize; ++i) {
+          SmallVector<int64_t> startOffsets(newRank, 0);
+          SmallVector<int64_t> endOffsets;
+
+          for (int d = 0; d < newRank; ++d) {
+            if (hasPacking && d == 0) {
+              startOffsets[d] = p;
+              endOffsets.push_back(p + 1);
+            } else if (d == actualReduceDim) {
+              startOffsets[d] = k + i;
+              endOffsets.push_back(k + i + 1);
+            } else if (!hasPacking && d == (isFirst ? 0 : newRank - 1)) {
+              startOffsets[d] = 0;
+              endOffsets.push_back(1);
+            } else {
+              int outD = d;
+              if (hasPacking && outRank < newRank) {
+                if (d > actualReduceDim) outD = d - 1;
+              } else if (!hasPacking && outRank > newRank) {
+                if (d > actualReduceDim) outD = d + 1;
+              }
+              startOffsets[d] = 0;
+              endOffsets.push_back(outShape[outD]);
+            }
+          }
+
+          SmallVector<int64_t> sliceShape;
+          for (size_t d = 0; d < newRank; ++d) {
+            sliceShape.push_back(endOffsets[d] - startOffsets[d]);
+          }
+
+          auto sliceOp = rewriter.create<stablehlo::SliceOp>(
+              loc, RankedTensorType::get(sliceShape, tensorType.getElementType()),
+              paddedInput, rewriter.getDenseI64ArrayAttr(startOffsets),
+              rewriter.getDenseI64ArrayAttr(endOffsets),
+              rewriter.getDenseI64ArrayAttr(SmallVector<int64_t>(newRank, 1)));
+          slices.push_back(sliceOp);
         }
+
+        std::function<Value(const SmallVector<Value>&, size_t, size_t)> treeSum = 
+          [&](const SmallVector<Value>& localSlices, size_t start, size_t end) -> Value {
+            if (start == end) return localSlices[start];
+            size_t mid = start + (end - start) / 2;
+            Value left = treeSum(localSlices, start, mid);
+            Value right = treeSum(localSlices, mid + 1, end);
+            return rewriter.create<stablehlo::AddOp>(loc, left, right);
+          };
+
+        rollingResults.push_back(treeSum(slices, 0, slices.size() - 1));
       }
-      SmallVector<int64_t> sliceStrides(dims.size(), 1);
-      slices.push_back(rewriter.create<stablehlo::SliceOp>(
-          loc, RankedTensorType::get(outShape, outType.getElementType()), 
-          paddedInput, 
-          rewriter.getDenseI64ArrayAttr(startOffsets), 
-          rewriter.getDenseI64ArrayAttr(endOffsets), 
-          rewriter.getDenseI64ArrayAttr(sliceStrides)));
+
+      Value packingResult;
+      if (rollingResults.size() == 1) {
+        packingResult = rollingResults[0];
+      } else {
+        SmallVector<int64_t> concatShape = llvm::to_vector(cast<RankedTensorType>(rollingResults[0].getType()).getShape());
+        concatShape[actualReduceDim] = outSize;
+        packingResult = rewriter.create<stablehlo::ConcatenateOp>(
+            loc, RankedTensorType::get(concatShape, tensorType.getElementType()),
+            rollingResults, actualReduceDim);
+      }
+      packingResults.push_back(packingResult);
     }
 
-    std::function<Value(size_t, size_t)> treeSum = [&](size_t start, size_t end) -> Value {
-      if (start == end) return slices[start];
-      size_t mid = start + (end - start) / 2;
-      Value left = treeSum(start, mid);
-      Value right = treeSum(mid + 1, end);
-      return rewriter.create<stablehlo::AddOp>(loc, left, right);
-    };
+    Value finalResult;
+    if (packingResults.size() == 1) {
+      finalResult = packingResults[0];
+    } else {
+      SmallVector<int64_t> concatShape = llvm::to_vector(cast<RankedTensorType>(packingResults[0].getType()).getShape());
+      concatShape[0] = packingSize;
+      finalResult = rewriter.create<stablehlo::ConcatenateOp>(
+          loc, RankedTensorType::get(concatShape, tensorType.getElementType()),
+          packingResults, 0);
+    }
 
-    Value finalSum = treeSum(0, slices.size() - 1);
-    rewriter.replaceOp(op, finalSum);
+    if (outRank < newRank && !hasPacking) {
+      finalResult = rewriter.create<stablehlo::ReshapeOp>(loc, outType, finalResult);
+    }
+
+    rewriter.replaceOp(reduceOp, finalResult);
     return success();
   }
 };
@@ -1743,7 +1808,11 @@ struct IsResultTypeLegal<stablehlo::ReduceWindowOp> {
 
   bool operator()(stablehlo::ReduceWindowOp op) const {
     if (op.getResults().empty()) return true;
-    return typeConverter.isLegal(op.getResults()[0].getType());
+    if (!typeConverter.isLegal(op.getResults()[0].getType())) return false;
+    if (op.getInputs().empty()) return true;
+    auto inputType = cast<RankedTensorType>(op.getInputs()[0].getType());
+    if (inputType.getRank() != op.getWindowDimensions().size()) return false;
+    return true;
   }
 };
 
@@ -1973,7 +2042,7 @@ struct MultiFloatConversionPass
     RewritePatternSet patterns(context);
     patterns.add<ConstantOpConversion>(typeConverter, context, concatDimension, expansionSize, srcTy, tgtTy);
     if (expansionSize >= 2) {
-      patterns.add<LowerReduceWindowOp>(context, srcTy);
+      patterns.add<LowerReduceWindowOp>(typeConverter, context, srcTy, concatDimension);
     }
     if (expansionSize == 1) {
       patterns.add<GenericOpConversion<stablehlo::AddOp>>(typeConverter, context);

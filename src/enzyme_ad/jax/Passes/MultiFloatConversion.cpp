@@ -1375,6 +1375,104 @@ struct ReshapeOpConversion : public OpConversionPattern<stablehlo::ReshapeOp> {
 };
 
 
+struct CompareOpConversion : public OpConversionPattern<stablehlo::CompareOp> {
+  StringRef concatDimension;
+
+  CompareOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::CompareOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(stablehlo::CompareOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value lhs = adaptor.getOperands()[0];
+    Value rhs = adaptor.getOperands()[1];
+
+    Value lhs_hi = extractLimb(lhs, 0, rewriter, loc, concatDimension);
+    Value lhs_lo = extractLimb(lhs, 1, rewriter, loc, concatDimension);
+    Value rhs_hi = extractLimb(rhs, 0, rewriter, loc, concatDimension);
+    Value rhs_lo = extractLimb(rhs, 1, rewriter, loc, concatDimension);
+
+    auto resultType = cast<RankedTensorType>(op.getType());
+    auto shape = resultType.getShape();
+    auto boolType = rewriter.getI1Type();
+    auto trueAttr = DenseElementsAttr::get(RankedTensorType::get(shape, boolType), true);
+    auto falseAttr = DenseElementsAttr::get(RankedTensorType::get(shape, boolType), false);
+    Value true_val = rewriter.create<stablehlo::ConstantOp>(loc, trueAttr);
+    Value false_val = rewriter.create<stablehlo::ConstantOp>(loc, falseAttr);
+
+    auto direction = op.getComparisonDirection();
+
+    Value res;
+    if (direction == stablehlo::ComparisonDirection::EQ) {
+      Value hi_eq = rewriter.create<stablehlo::CompareOp>(loc, lhs_hi, rhs_hi, stablehlo::ComparisonDirection::EQ);
+      Value lo_eq = rewriter.create<stablehlo::CompareOp>(loc, lhs_lo, rhs_lo, stablehlo::ComparisonDirection::EQ);
+      res = rewriter.create<stablehlo::SelectOp>(loc, hi_eq, lo_eq, false_val);
+    } else if (direction == stablehlo::ComparisonDirection::NE) {
+      Value hi_ne = rewriter.create<stablehlo::CompareOp>(loc, lhs_hi, rhs_hi, stablehlo::ComparisonDirection::NE);
+      Value lo_ne = rewriter.create<stablehlo::CompareOp>(loc, lhs_lo, rhs_lo, stablehlo::ComparisonDirection::NE);
+      res = rewriter.create<stablehlo::SelectOp>(loc, hi_ne, true_val, lo_ne);
+    } else {
+      stablehlo::ComparisonDirection dir_hi;
+      stablehlo::ComparisonDirection dir_lo;
+      if (direction == stablehlo::ComparisonDirection::GE) { dir_hi = stablehlo::ComparisonDirection::GT; dir_lo = stablehlo::ComparisonDirection::GE; }
+      else if (direction == stablehlo::ComparisonDirection::GT) { dir_hi = stablehlo::ComparisonDirection::GT; dir_lo = stablehlo::ComparisonDirection::GT; }
+      else if (direction == stablehlo::ComparisonDirection::LE) { dir_hi = stablehlo::ComparisonDirection::LT; dir_lo = stablehlo::ComparisonDirection::LE; }
+      else if (direction == stablehlo::ComparisonDirection::LT) { dir_hi = stablehlo::ComparisonDirection::LT; dir_lo = stablehlo::ComparisonDirection::LT; }
+      else { return failure(); }
+
+      Value hi_gt = rewriter.create<stablehlo::CompareOp>(loc, lhs_hi, rhs_hi, dir_hi);
+      Value hi_eq = rewriter.create<stablehlo::CompareOp>(loc, lhs_hi, rhs_hi, stablehlo::ComparisonDirection::EQ);
+      Value lo_cond = rewriter.create<stablehlo::CompareOp>(loc, lhs_lo, rhs_lo, dir_lo);
+      
+      res = rewriter.create<stablehlo::SelectOp>(loc, hi_eq, lo_cond, hi_gt);
+    }
+
+    rewriter.replaceOp(op, res);
+    return success();
+  }
+};
+
+struct DynamicUpdateSliceOpConversion : public OpConversionPattern<stablehlo::DynamicUpdateSliceOp> {
+  StringRef concatDimension;
+
+  DynamicUpdateSliceOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<stablehlo::DynamicUpdateSliceOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(stablehlo::DynamicUpdateSliceOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    llvm::errs() << "DynamicUpdateSliceOpConversion called\n";
+    Location loc = op.getLoc();
+    Value operand = adaptor.getOperands()[0];
+    Value update = adaptor.getOperands()[1];
+    auto indices = adaptor.getOperands().drop_front(2);
+
+    Value operand_hi = extractLimb(operand, 0, rewriter, loc, concatDimension);
+    Value operand_lo = extractLimb(operand, 1, rewriter, loc, concatDimension);
+    Value update_hi = extractLimb(update, 0, rewriter, loc, concatDimension);
+    Value update_lo = extractLimb(update, 1, rewriter, loc, concatDimension);
+
+    auto rankNOperandType = cast<RankedTensorType>(op.getOperand().getType());
+    Value operand_hi_N = rewriter.create<stablehlo::ReshapeOp>(loc, rankNOperandType, operand_hi);
+    Value operand_lo_N = rewriter.create<stablehlo::ReshapeOp>(loc, rankNOperandType, operand_lo);
+
+    auto rankNUpdateType = cast<RankedTensorType>(op.getUpdate().getType());
+    Value update_hi_N = rewriter.create<stablehlo::ReshapeOp>(loc, rankNUpdateType, update_hi);
+    Value update_lo_N = rewriter.create<stablehlo::ReshapeOp>(loc, rankNUpdateType, update_lo);
+
+    Value hi_N = rewriter.create<stablehlo::DynamicUpdateSliceOp>(loc, rankNOperandType, operand_hi_N, update_hi_N, indices);
+    Value lo_N = rewriter.create<stablehlo::DynamicUpdateSliceOp>(loc, rankNOperandType, operand_lo_N, update_lo_N, indices);
+
+    auto rankNPlusOneType = cast<RankedTensorType>(operand_hi.getType());
+    Value hi = rewriter.create<stablehlo::ReshapeOp>(loc, rankNPlusOneType, hi_N);
+    Value lo = rewriter.create<stablehlo::ReshapeOp>(loc, rankNPlusOneType, lo_N);
+
+    Value packed = packLimbs(hi, lo, rewriter, loc, concatDimension);
+    rewriter.replaceOp(op, packed);
+    return success();
+  }
+};
+
+
 struct DotGeneralOpConversion : public OpConversionPattern<stablehlo::DotGeneralOp> {
   StringRef concatDimension;
 
@@ -2144,8 +2242,24 @@ struct IsResultOrOperandTypeLegal {
   IsResultOrOperandTypeLegal(const TypeConverter &tc) : typeConverter(tc) {}
 
   bool operator()(OpTy op) const {
-    if (!this->typeConverter.isLegal(op.getType())) return false;
-    if (op->getNumOperands() > 0 && !this->typeConverter.isLegal(op->getOperand(0).getType())) return false;
+    if (std::is_same<OpTy, stablehlo::DynamicUpdateSliceOp>::value) {
+      llvm::errs() << "Checking DynamicUpdateSliceOp legality for result: " << op.getType() << "\n";
+    }
+    if (!this->typeConverter.isLegal(op.getType())) {
+      if (std::is_same<OpTy, stablehlo::DynamicUpdateSliceOp>::value) {
+        llvm::errs() << "DynamicUpdateSliceOp result is illegal\n";
+      }
+      return false;
+    }
+    if (op->getNumOperands() > 0 && !this->typeConverter.isLegal(op->getOperand(0).getType())) {
+      if (std::is_same<OpTy, stablehlo::DynamicUpdateSliceOp>::value) {
+        llvm::errs() << "DynamicUpdateSliceOp operand 0 is illegal\n";
+      }
+      return false;
+    }
+    if (std::is_same<OpTy, stablehlo::DynamicUpdateSliceOp>::value) {
+      llvm::errs() << "DynamicUpdateSliceOp is legal!\n";
+    }
     return true;
   }
 };
@@ -2287,6 +2401,21 @@ struct MultiFloatConversionPass
           returnOp.getOperation()->setOperands(newReturnOperands);
         });
       });
+    } else {
+      llvm::errs() << "MultiFloatConversion: Running else block for non-signature conversion\n";
+      op->walk([&](func::FuncOp func) {
+        if (func.empty()) return;
+        OpBuilder builder(&func.front(), func.front().begin());
+        auto &block = func.front();
+        for (unsigned i = 0; i < block.getNumArguments(); ++i) {
+          Type oldType = block.getArgument(i).getType();
+          Type newType = typeConverter.convertType(oldType);
+          if (oldType != newType) {
+            auto cast = builder.create<UnrealizedConversionCastOp>(func.getLoc(), newType, block.getArgument(i));
+            block.getArgument(i).replaceAllUsesExcept(cast.getResult(0), cast);
+          }
+        }
+      });
     }
 
     target.addLegalOp<UnrealizedConversionCastOp>();
@@ -2307,6 +2436,13 @@ struct MultiFloatConversionPass
     IsResultOrOperandTypeLegal<stablehlo::TransposeOp> transposeLegal(typeConverter);
     IsResultOrOperandTypeLegal<stablehlo::ReshapeOp> reshapeLegal(typeConverter);
     IsResultOrOperandTypeLegal<stablehlo::CompareOp> compareLegal(typeConverter);
+    IsResultOrOperandTypeLegal<stablehlo::SineOp> sineLegal(typeConverter);
+    IsResultOrOperandTypeLegal<stablehlo::DotGeneralOp> dotGeneralLegal(typeConverter);
+    IsResultOrOperandTypeLegal<enzymexla::RotateOp> rotateLegal(typeConverter);
+    IsResultOrOperandTypeLegal<enzymexla::WrapOp> wrapLegal(typeConverter);
+    IsResultOrOperandTypeLegal<enzymexla::ExtendOp> extendLegal(typeConverter);
+    IsResultOrOperandTypeLegal<stablehlo::NegOp> negLegal(typeConverter);
+    IsResultOrOperandTypeLegal<stablehlo::DynamicUpdateSliceOp> dynamicUpdateSliceLegal(typeConverter);
 
     target.addDynamicallyLegalOp<stablehlo::ConstantOp>([&](stablehlo::ConstantOp op) {
       return typeConverter.isLegal(op.getType());
@@ -2326,9 +2462,14 @@ struct MultiFloatConversionPass
     target.addDynamicallyLegalOp<stablehlo::BroadcastInDimOp>(broadcastLegal);
     target.addDynamicallyLegalOp<stablehlo::TransposeOp>(transposeLegal);
     target.addDynamicallyLegalOp<stablehlo::ReshapeOp>(reshapeLegal);
-    if (expansionSize == 1) {
-      target.addDynamicallyLegalOp<stablehlo::CompareOp>(compareLegal);
-    }
+    target.addDynamicallyLegalOp<stablehlo::CompareOp>(compareLegal);
+    target.addDynamicallyLegalOp<stablehlo::SineOp>(sineLegal);
+    target.addDynamicallyLegalOp<stablehlo::DotGeneralOp>(dotGeneralLegal);
+    target.addDynamicallyLegalOp<enzymexla::RotateOp>(rotateLegal);
+    target.addDynamicallyLegalOp<enzymexla::WrapOp>(wrapLegal);
+    target.addDynamicallyLegalOp<enzymexla::ExtendOp>(extendLegal);
+    target.addDynamicallyLegalOp<stablehlo::NegOp>(negLegal);
+    target.addDynamicallyLegalOp<stablehlo::DynamicUpdateSliceOp>(dynamicUpdateSliceLegal);
     target.addDynamicallyLegalOp<stablehlo::AddOp>(addLegal);
     target.addDynamicallyLegalOp<stablehlo::SubtractOp>(subLegal);
     target.addDynamicallyLegalOp<stablehlo::MulOp>(mulLegal);
@@ -2400,6 +2541,9 @@ struct MultiFloatConversionPass
       patterns.add<GenericOpConversion<enzymexla::WrapOp>>(typeConverter, context);
       patterns.add<GenericOpConversion<enzymexla::ExtendOp>>(typeConverter, context);
       patterns.add<GenericOpConversion<enzymexla::UpdateWithoutCornersOp>>(typeConverter, context);
+      patterns.add<GenericOpConversion<stablehlo::SineOp>>(typeConverter, context);
+      patterns.add<GenericOpConversion<stablehlo::NegOp>>(typeConverter, context);
+      patterns.add<GenericOpConversion<stablehlo::DynamicUpdateSliceOp>>(typeConverter, context);
     } else if (expansionSize == 2) {
       patterns.add<AddOpConversion>(typeConverter, context, srcTy, concatDimension);
       patterns.add<SubOpConversion>(typeConverter, context, concatDimension);
@@ -2421,6 +2565,13 @@ struct MultiFloatConversionPass
       patterns.add<ConcatenateOpOptimization>(typeConverter, context, 2);
       patterns.add<ConcatenateOpConversion>(typeConverter, context, concatDimension);
       patterns.add<ConvertOpConversion>(typeConverter, context, concatDimension, srcTy, tgtTy, expansionSize);
+      patterns.add<CompareOpConversion>(typeConverter, context, concatDimension);
+      patterns.add<GenericOpConversion<stablehlo::NegOp>>(typeConverter, context);
+      patterns.add<DynamicUpdateSliceOpConversion>(typeConverter, context, concatDimension);
+      patterns.add<GenericOpConversion<enzymexla::RotateOp>>(typeConverter, context);
+      patterns.add<GenericOpConversion<enzymexla::WrapOp>>(typeConverter, context);
+      patterns.add<GenericOpConversion<enzymexla::ExtendOp>>(typeConverter, context);
+      patterns.add<GenericOpConversion<stablehlo::SineOp>>(typeConverter, context);
     } else {
       op->emitError() << "Unsupported expansion size specified: " << (int)expansionSize;
       signalPassFailure();

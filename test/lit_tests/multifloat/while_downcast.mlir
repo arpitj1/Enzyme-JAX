@@ -1,4 +1,4 @@
-// RUN: enzymexlamlir-opt --multi-float-conversion="source-type=f64 target-type=f32 expansion-size=1 convert-signatures=true" %s | FileCheck %s
+// RUN: enzymexlamlir-opt --multi-float-conversion="source-type=f64 target-type=f32 expansion-size=1 convert-signatures=true" --canonicalize %s | FileCheck %s
 
 func.func @while(%arg0: tensor<f64>) -> tensor<f64> {
   %cst = stablehlo.constant dense<1.000000e+01> : tensor<f64>

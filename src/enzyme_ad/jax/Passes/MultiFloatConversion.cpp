@@ -48,6 +48,13 @@ Value extractLimb(Value tensor, int limbIndex, OpBuilder &builder, Location loc,
     if (isTuple) {
       if (castOp.getNumOperands() > 1)
         return castOp.getOperand(limbIndex);
+      if (castOp.getNumOperands() == 1 && isa<TupleType>(castOp.getOperand(0).getType())) {
+        Value tupleVal = castOp.getOperand(0);
+        if (auto tupleOp = tupleVal.getDefiningOp<stablehlo::TupleOp>()) {
+          return tupleOp.getOperand(limbIndex);
+        }
+        return builder.create<stablehlo::GetTupleElementOp>(loc, tupleVal, builder.getI32IntegerAttr(limbIndex));
+      }
     } else {
       Value expanded = castOp.getOperand(0);
       auto expandedType = dyn_cast<RankedTensorType>(expanded.getType());
@@ -228,13 +235,24 @@ struct GenericOpConversion : public OpConversionPattern<OpTy> {
     if (op->getResults().empty())
       return failure();
 
+    SmallVector<Value> operands;
     for (auto operand : adaptor.getOperands()) {
-      if (!this->getTypeConverter()->isLegal(operand.getType()))
-        return failure();
+      if (!this->getTypeConverter()->isLegal(operand.getType())) {
+        if (auto cast = operand.template getDefiningOp<UnrealizedConversionCastOp>()) {
+          if (this->getTypeConverter()->isLegal(cast.getOperand(0).getType())) {
+            operand = cast.getOperand(0);
+          } else {
+            return failure();
+          }
+        } else {
+          return failure();
+        }
+      }
+      operands.push_back(operand);
     }
       
     OperationState state(op.getLoc(), OpTy::getOperationName());
-    state.addOperands(adaptor.getOperands());
+    state.addOperands(operands);
     state.addAttributes(op->getAttrs());
     for (unsigned i = 0; i < op->getNumRegions(); ++i) {
       Region &region = op->getRegion(i);
@@ -300,12 +318,18 @@ struct ConstantOpConversion : public OpConversionPattern<stablehlo::ConstantOp> 
 
         if (elementsAttr.isSplat()) {
           auto val = elementsAttr.getSplatValue<APFloat>();
-          double dval = val.convertToDouble();
-          float hi = (float)dval;
-          float lo = (float)(dval - hi);
+          APFloat hiAP = val;
+          bool losesInfo;
+          hiAP.convert(cast<FloatType>(targetType).getFloatSemantics(), APFloat::rmNearestTiesToEven, &losesInfo);
 
-          APFloat hiAP(hi);
-          APFloat loAP(lo);
+          APFloat hiSource = hiAP;
+          hiSource.convert(cast<FloatType>(sourceType).getFloatSemantics(), APFloat::rmNearestTiesToEven, &losesInfo);
+
+          APFloat loSource = val;
+          loSource.subtract(hiSource, APFloat::rmNearestTiesToEven);
+
+          APFloat loAP = loSource;
+          loAP.convert(cast<FloatType>(targetType).getFloatSemantics(), APFloat::rmNearestTiesToEven, &losesInfo);
 
           auto hiAttr = SplatElementsAttr::get(limbType, hiAP);
           auto loAttr = SplatElementsAttr::get(limbType, loAP);
@@ -319,11 +343,21 @@ struct ConstantOpConversion : public OpConversionPattern<stablehlo::ConstantOp> 
           SmallVector<Attribute> hiAttrs;
           SmallVector<Attribute> loAttrs;
           for (auto val : elementsAttr.getValues<APFloat>()) {
-            double dval = val.convertToDouble();
-            float hi = (float)dval;
-            float lo = (float)(dval - hi);
-            hiAttrs.push_back(rewriter.getFloatAttr(targetType, hi));
-            loAttrs.push_back(rewriter.getFloatAttr(targetType, lo));
+            APFloat hiAP = val;
+            bool losesInfo;
+            hiAP.convert(cast<FloatType>(targetType).getFloatSemantics(), APFloat::rmNearestTiesToEven, &losesInfo);
+
+            APFloat hiSource = hiAP;
+            hiSource.convert(cast<FloatType>(sourceType).getFloatSemantics(), APFloat::rmNearestTiesToEven, &losesInfo);
+
+            APFloat loSource = val;
+            loSource.subtract(hiSource, APFloat::rmNearestTiesToEven);
+
+            APFloat loAP = loSource;
+            loAP.convert(cast<FloatType>(targetType).getFloatSemantics(), APFloat::rmNearestTiesToEven, &losesInfo);
+
+            hiAttrs.push_back(rewriter.getFloatAttr(targetType, hiAP));
+            loAttrs.push_back(rewriter.getFloatAttr(targetType, loAP));
           }
           auto hiAttr = DenseElementsAttr::get(limbType, hiAttrs);
           auto loAttr = DenseElementsAttr::get(limbType, loAttrs);
@@ -388,6 +422,7 @@ struct AddOpConversion : public OpConversionPattern<stablehlo::AddOp> {
 
   LogicalResult matchAndRewrite(stablehlo::AddOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
+    llvm::errs() << "AddOpConversion called\n";
     Location loc = op.getLoc();
 
     Value x1 = extractLimb(adaptor.getOperands()[0], 0, rewriter, loc, concatDimension);
@@ -405,6 +440,7 @@ struct AddOpConversion : public OpConversionPattern<stablehlo::AddOp> {
     
     Value packed = packLimbs(final_a, final_b, rewriter, loc, concatDimension);
     rewriter.replaceOp(op, packed);
+    llvm::errs() << "AddOpConversion succeeded\n";
     return success();
   }
 };
@@ -968,23 +1004,44 @@ struct ReturnOpConversion : public OpConversionPattern<stablehlo::ReturnOp> {
 
   LogicalResult matchAndRewrite(stablehlo::ReturnOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
+    llvm::errs() << "ReturnOpConversion called\n";
     Location loc = op.getLoc();
     SmallVector<Value> newOperands;
 
+    llvm::errs() << "ReturnOp parent: " << op->getParentOp()->getName().getStringRef() << "\n";
     bool isFuncReturn = isa<func::FuncOp>(op->getParentOp());
 
     if (!isFuncReturn) {
-      if (isa<stablehlo::WhileOp>(op->getParentOp()) && concatDimension == "tuple") {
+      if (op->getParentOp()->getName().getStringRef() == "stablehlo.while") {
+        llvm::errs() << "ReturnOp inside WhileOp found\n";
         SmallVector<Value> flatOperands;
-        for (auto operand : adaptor.getOperands()) {
-          if (auto tupleTy = dyn_cast<TupleType>(operand.getType())) {
-            flatOperands.push_back(rewriter.create<stablehlo::GetTupleElementOp>(loc, operand, 0));
-            flatOperands.push_back(rewriter.create<stablehlo::GetTupleElementOp>(loc, operand, 1));
-          } else {
+        if (concatDimension == "tuple") {
+          llvm::errs() << "Tuple mode handling\n";
+          for (auto operand : adaptor.getOperands()) {
+            llvm::errs() << "Operand type: " << operand.getType() << "\n";
+            Value hi = extractLimb(operand, 0, rewriter, loc, concatDimension);
+            Value lo = extractLimb(operand, 1, rewriter, loc, concatDimension);
+            llvm::errs() << "Extracted hi type: " << hi.getType() << "\n";
+            flatOperands.push_back(hi);
+            flatOperands.push_back(lo);
+          }
+        } else if (concatDimension == "first") {
+          llvm::errs() << "First mode handling\n";
+          for (auto operand : adaptor.getOperands()) {
+            if (auto castOp = operand.getDefiningOp<UnrealizedConversionCastOp>()) {
+              flatOperands.push_back(castOp.getOperand(0));
+            } else {
+              flatOperands.push_back(operand);
+            }
+          }
+        } else {
+          for (auto operand : adaptor.getOperands()) {
             flatOperands.push_back(operand);
           }
         }
+        llvm::errs() << "Flattened operands count: " << flatOperands.size() << "\n";
         rewriter.replaceOpWithNewOp<stablehlo::ReturnOp>(op, flatOperands);
+        llvm::errs() << "Replaced ReturnOp\n";
         return success();
       }
 
@@ -1072,15 +1129,42 @@ struct ReturnOpConversion : public OpConversionPattern<stablehlo::ReturnOp> {
 struct ReduceWindowOpConversion : public OpConversionPattern<stablehlo::ReduceWindowOp> {
   StringRef concatDimension;
 
+  int expansionSize;
+
+  Type sourceType;
   Type targetType;
 
-  ReduceWindowOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension, Type targetType)
-      : OpConversionPattern<stablehlo::ReduceWindowOp>(typeConverter, context), concatDimension(concatDimension), targetType(targetType) {}
+  ReduceWindowOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension, int expansionSize, Type sourceType, Type targetType)
+      : OpConversionPattern<stablehlo::ReduceWindowOp>(typeConverter, context), concatDimension(concatDimension), expansionSize(expansionSize), sourceType(sourceType), targetType(targetType) {}
 
   LogicalResult matchAndRewrite(stablehlo::ReduceWindowOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     bool isTuple = concatDimension == "tuple";
+
+    if (expansionSize == 1) {
+      if (adaptor.getOperands().size() < 2)
+        return failure();
+      Value operand = adaptor.getOperands()[0];
+      Value initValue = adaptor.getOperands()[1];
+
+      auto outType = cast<RankedTensorType>(op.getResults()[0].getType());
+      auto partType = RankedTensorType::get(outType.getShape(), targetType);
+
+      auto newOp = rewriter.create<stablehlo::ReduceWindowOp>(
+          loc, partType, operand, initValue,
+          op.getWindowDimensions(), op.getWindowStridesAttr() ? op.getWindowStridesAttr() : nullptr,
+          op.getBaseDilationsAttr() ? op.getBaseDilationsAttr() : nullptr,
+          op.getWindowDilationsAttr() ? op.getWindowDilationsAttr() : nullptr,
+          op.getPaddingAttr() ? op.getPaddingAttr() : nullptr);
+
+      rewriter.inlineRegionBefore(op.getRegion(), newOp.getRegion(), newOp.getRegion().end());
+      if (failed(rewriter.convertRegionTypes(&newOp.getRegion(), *getTypeConverter())))
+        return failure();
+
+      rewriter.replaceOp(op, newOp.getResults());
+      return success();
+    }
 
     if (isTuple) {
       return failure();
@@ -1654,8 +1738,9 @@ struct IsResultOrOperandTypeLegal {
   IsResultOrOperandTypeLegal(const TypeConverter &tc) : typeConverter(tc) {}
 
   bool operator()(OpTy op) const {
-    if (typeConverter.isLegal(op.getType())) return true;
-    return typeConverter.isLegal(op.getOperand().getType());
+    if (!this->typeConverter.isLegal(op.getType())) return false;
+    if (op->getNumOperands() > 0 && !this->typeConverter.isLegal(op->getOperand(0).getType())) return false;
+    return true;
   }
 };
 
@@ -1736,6 +1821,59 @@ struct MultiFloatConversionPass
       return builder.create<UnrealizedConversionCastOp>(loc, type, inputs).getResult(0);
     });
 
+    if (convertSignatures) {
+      op->walk([&](func::FuncOp func) {
+        SmallVector<Type> oldArgTypes;
+        for (auto arg : func.getArguments()) {
+          oldArgTypes.push_back(arg.getType());
+        }
+
+        SmallVector<Type> newArgTypes;
+        for (auto ty : oldArgTypes) {
+          newArgTypes.push_back(typeConverter.convertType(ty));
+        }
+
+        SmallVector<Type> newResTypes;
+        for (auto ty : func.getFunctionType().getResults()) {
+          newResTypes.push_back(typeConverter.convertType(ty));
+        }
+
+        auto newFuncType = FunctionType::get(context, newArgTypes, newResTypes);
+        func.setType(newFuncType);
+
+        if (!func.empty()) {
+          OpBuilder builder(&func.front(), func.front().begin());
+          auto &block = func.front();
+          for (unsigned i = 0; i < block.getNumArguments(); ++i) {
+            Type oldType = oldArgTypes[i];
+            Type newType = newArgTypes[i];
+            if (oldType != newType) {
+              block.getArgument(i).setType(newType);
+              auto cast = builder.create<UnrealizedConversionCastOp>(func.getLoc(), oldType, block.getArgument(i));
+              block.getArgument(i).replaceAllUsesExcept(cast.getResult(0), cast);
+            }
+          }
+        }
+
+        // Update return ops to keep IR valid for verifier
+        func.walk([&](func::ReturnOp returnOp) {
+          OpBuilder builder(returnOp);
+          SmallVector<Value> newReturnOperands;
+          for (unsigned i = 0; i < returnOp.getNumOperands(); ++i) {
+            Type oldType = returnOp.getOperand(i).getType();
+            Type newType = newResTypes[i];
+            if (oldType != newType) {
+              auto cast = builder.create<UnrealizedConversionCastOp>(returnOp.getLoc(), newType, returnOp.getOperand(i));
+              newReturnOperands.push_back(cast.getResult(0));
+            } else {
+              newReturnOperands.push_back(returnOp.getOperand(i));
+            }
+          }
+          returnOp.getOperation()->setOperands(newReturnOperands);
+        });
+      });
+    }
+
     target.addLegalOp<UnrealizedConversionCastOp>();
 
     IsResultTypeLegal<stablehlo::AddOp> addLegal(typeConverter);
@@ -1753,6 +1891,7 @@ struct MultiFloatConversionPass
     IsResultOrOperandTypeLegal<stablehlo::BroadcastInDimOp> broadcastLegal(typeConverter);
     IsResultOrOperandTypeLegal<stablehlo::TransposeOp> transposeLegal(typeConverter);
     IsResultOrOperandTypeLegal<stablehlo::ReshapeOp> reshapeLegal(typeConverter);
+    IsResultOrOperandTypeLegal<stablehlo::CompareOp> compareLegal(typeConverter);
 
     target.addDynamicallyLegalOp<stablehlo::ConstantOp>([&](stablehlo::ConstantOp op) {
       return typeConverter.isLegal(op.getType());
@@ -1772,6 +1911,7 @@ struct MultiFloatConversionPass
     target.addDynamicallyLegalOp<stablehlo::BroadcastInDimOp>(broadcastLegal);
     target.addDynamicallyLegalOp<stablehlo::TransposeOp>(transposeLegal);
     target.addDynamicallyLegalOp<stablehlo::ReshapeOp>(reshapeLegal);
+    target.addDynamicallyLegalOp<stablehlo::CompareOp>(compareLegal);
     target.addDynamicallyLegalOp<stablehlo::AddOp>(addLegal);
     target.addDynamicallyLegalOp<stablehlo::SubtractOp>(subLegal);
     target.addDynamicallyLegalOp<stablehlo::MulOp>(mulLegal);
@@ -1799,7 +1939,7 @@ struct MultiFloatConversionPass
              typeConverter.isLegal(op.getResultTypes());
     });
     target.addDynamicallyLegalOp<stablehlo::ReturnOp>([&](stablehlo::ReturnOp op) {
-      if (!convertSignatures) {
+      if (!convertSignatures && isa<func::FuncOp>(op->getParentOp())) {
         OpBuilder b(op.getContext());
         for (auto type : op.getOperandTypes()) {
           if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
@@ -1824,6 +1964,7 @@ struct MultiFloatConversionPass
       patterns.add<GenericOpConversion<stablehlo::MulOp>>(typeConverter, context);
       patterns.add<GenericOpConversion<stablehlo::DivOp>>(typeConverter, context);
       patterns.add<GenericOpConversion<stablehlo::SelectOp>>(typeConverter, context);
+      patterns.add<GenericOpConversion<stablehlo::CompareOp>>(typeConverter, context);
       patterns.add<GenericOpConversion<stablehlo::ReverseOp>>(typeConverter, context);
       patterns.add<GenericOpConversion<stablehlo::AbsOp>>(typeConverter, context);
       patterns.add<GenericOpConversion<stablehlo::SqrtOp>>(typeConverter, context);
@@ -1833,7 +1974,7 @@ struct MultiFloatConversionPass
       patterns.add<GenericOpConversion<stablehlo::ReshapeOp>>(typeConverter, context);
       patterns.add<GenericOpConversion<stablehlo::DotGeneralOp>>(typeConverter, context);
       patterns.add<GenericOpConversion<stablehlo::PadOp>>(typeConverter, context);
-      patterns.add<GenericOpConversion<stablehlo::ReduceWindowOp>>(typeConverter, context);
+      patterns.add<ReduceWindowOpConversion>(typeConverter, context, concatDimension, expansionSize, srcTy, tgtTy);
       patterns.add<WhileOpConversion>(typeConverter, context, concatDimension);
       patterns.add<ReturnOpConversion>(typeConverter, context, concatDimension, convertSignatures, expansionSize, srcTy, tgtTy);
       patterns.add<GenericOpConversion<stablehlo::ConcatenateOp>>(typeConverter, context);
@@ -1859,7 +2000,7 @@ struct MultiFloatConversionPass
       patterns.add<PadOpConversion>(typeConverter, context, concatDimension);
       patterns.add<WhileOpConversion>(typeConverter, context, concatDimension);
       patterns.add<ReturnOpConversion>(typeConverter, context, concatDimension, convertSignatures, expansionSize, srcTy, tgtTy);
-      patterns.add<ReduceWindowOpConversion>(typeConverter, context, concatDimension, tgtTy);
+      patterns.add<ReduceWindowOpConversion>(typeConverter, context, concatDimension, expansionSize, srcTy, tgtTy);
       patterns.add<ConcatenateOpOptimization>(typeConverter, context, 2);
       patterns.add<ConcatenateOpConversion>(typeConverter, context, concatDimension);
       patterns.add<ConvertOpConversion>(typeConverter, context, concatDimension, srcTy, tgtTy, expansionSize);

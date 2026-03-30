@@ -15,12 +15,10 @@ func.func @reduce_window_sum(%arg0: tensor<4x4xf64>) -> tensor<4x4xf64> {
 }
 
 // CHECK-LABEL: func.func @reduce_window_sum
-// CHECK: %[[CST:.*]] = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-// CHECK: %[[PAD_VAL:.*]] = builtin.unrealized_conversion_cast %[[CST]] : tensor<f64> to tensor<f32>
-// CHECK: %[[PADDED:.*]] = stablehlo.pad %{{.*}}, %[[PAD_VAL]], low = [2, 0], high = [0, 0], interior = [0, 0]
-// CHECK: %[[S0:.*]] = stablehlo.slice %[[PADDED]] [0:4, 0:4]
-// CHECK: %[[S1:.*]] = stablehlo.slice %[[PADDED]] [1:5, 0:4]
-// CHECK: %[[S2:.*]] = stablehlo.slice %[[PADDED]] [2:6, 0:4]
-// CHECK: %[[ADD0:.*]] = stablehlo.add %[[S0]], %[[S1]]
-// CHECK: %[[ADD1:.*]] = stablehlo.add %[[ADD0]], %[[S2]]
+// CHECK: %[[CST:.*]] = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+// CHECK: %[[RES:.*]] = "stablehlo.reduce_window"(%{{.*}}, %[[CST]]) <{padding = dense<{{\[\[2, 0\], \[0, 0\]\]}}> : tensor<2x2xi64>, window_dimensions = array<i64: 3, 1>, window_strides = array<i64: 1, 1>}> ({
+// CHECK: ^bb0(%[[ARG1:.*]]: tensor<f32>, %[[ARG2:.*]]: tensor<f32>):
+// CHECK:   %[[ADD:.*]] = stablehlo.add %[[ARG1]], %[[ARG2]] : tensor<f32>
+// CHECK:   stablehlo.return %[[ADD]] : tensor<f32>
+// CHECK: }) : (tensor<4x4xf32>, tensor<f32>) -> tensor<4x4xf32>
 // CHECK: return %{{.*}}

@@ -1911,7 +1911,9 @@ struct MultiFloatConversionPass
     target.addDynamicallyLegalOp<stablehlo::BroadcastInDimOp>(broadcastLegal);
     target.addDynamicallyLegalOp<stablehlo::TransposeOp>(transposeLegal);
     target.addDynamicallyLegalOp<stablehlo::ReshapeOp>(reshapeLegal);
-    target.addDynamicallyLegalOp<stablehlo::CompareOp>(compareLegal);
+    if (expansionSize == 1) {
+      target.addDynamicallyLegalOp<stablehlo::CompareOp>(compareLegal);
+    }
     target.addDynamicallyLegalOp<stablehlo::AddOp>(addLegal);
     target.addDynamicallyLegalOp<stablehlo::SubtractOp>(subLegal);
     target.addDynamicallyLegalOp<stablehlo::MulOp>(mulLegal);

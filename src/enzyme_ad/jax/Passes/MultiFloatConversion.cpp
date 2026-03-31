@@ -599,7 +599,18 @@ struct SelectOpConversion : public OpConversionPattern<stablehlo::SelectOp> {
       return success();
     }
 
-    auto valuesType = cast<RankedTensorType>(adaptor.getOperands()[1].getType());
+    Type expectedType = getTypeConverter()->convertType(op.getType());
+    Value onTrue = adaptor.getOperands()[1];
+    Value onFalse = adaptor.getOperands()[2];
+
+    if (onTrue.getType() != expectedType) {
+      onTrue = rewriter.create<UnrealizedConversionCastOp>(loc, expectedType, onTrue).getResult(0);
+    }
+    if (onFalse.getType() != expectedType) {
+      onFalse = rewriter.create<UnrealizedConversionCastOp>(loc, expectedType, onFalse).getResult(0);
+    }
+
+    auto valuesType = cast<RankedTensorType>(expectedType);
     auto predType = cast<RankedTensorType>(adaptor.getOperands()[0].getType());
     
     bool skipBroadcast = predType.getRank() == 0 || predType.getShape() == valuesType.getShape();
@@ -622,8 +633,14 @@ struct SelectOpConversion : public OpConversionPattern<stablehlo::SelectOp> {
           loc, outType, adaptor.getOperands()[0], rewriter.getDenseI64ArrayAttr(broadcastDims));
     }
 
+    llvm::errs() << "SelectOpConversion creating SelectOp:\n";
+    llvm::errs() << "  valuesType: " << valuesType << "\n";
+    llvm::errs() << "  pred type: " << pred.getType() << "\n";
+    llvm::errs() << "  onTrue type: " << onTrue.getType() << "\n";
+    llvm::errs() << "  onFalse type: " << onFalse.getType() << "\n";
+
     auto selectOp = rewriter.create<stablehlo::SelectOp>(
-        loc, valuesType, pred, adaptor.getOperands()[1], adaptor.getOperands()[2]);
+        loc, valuesType, pred, onTrue, onFalse);
 
     rewriter.replaceOp(op, selectOp);
     return success();
@@ -1380,6 +1397,16 @@ struct CompareOpConversion : public OpConversionPattern<stablehlo::CompareOp> {
     Value lhs = adaptor.getOperands()[0];
     Value rhs = adaptor.getOperands()[1];
 
+    Type expectedLhsTy = getTypeConverter()->convertType(op.getOperands()[0].getType());
+    Type expectedRhsTy = getTypeConverter()->convertType(op.getOperands()[1].getType());
+
+    if (lhs.getType() != expectedLhsTy) {
+      lhs = rewriter.create<UnrealizedConversionCastOp>(loc, expectedLhsTy, lhs).getResult(0);
+    }
+    if (rhs.getType() != expectedRhsTy) {
+      rhs = rewriter.create<UnrealizedConversionCastOp>(loc, expectedRhsTy, rhs).getResult(0);
+    }
+
     Value lhs_hi = extractLimb(lhs, 0, rewriter, loc, concatDimension);
     Value lhs_lo = extractLimb(lhs, 1, rewriter, loc, concatDimension);
     Value rhs_hi = extractLimb(rhs, 0, rewriter, loc, concatDimension);
@@ -1399,10 +1426,28 @@ struct CompareOpConversion : public OpConversionPattern<stablehlo::CompareOp> {
     if (direction == stablehlo::ComparisonDirection::EQ) {
       Value hi_eq = rewriter.create<stablehlo::CompareOp>(loc, lhs_hi, rhs_hi, stablehlo::ComparisonDirection::EQ);
       Value lo_eq = rewriter.create<stablehlo::CompareOp>(loc, lhs_lo, rhs_lo, stablehlo::ComparisonDirection::EQ);
+      
+      hi_eq = rewriter.create<stablehlo::ReshapeOp>(loc, resultType, hi_eq);
+      lo_eq = rewriter.create<stablehlo::ReshapeOp>(loc, resultType, lo_eq);
+      
+      llvm::errs() << "CompareOpConversion EQ SelectOp:\n";
+      llvm::errs() << "  hi_eq type: " << hi_eq.getType() << "\n";
+      llvm::errs() << "  lo_eq type: " << lo_eq.getType() << "\n";
+      llvm::errs() << "  false_val type: " << false_val.getType() << "\n";
+
       res = rewriter.create<stablehlo::SelectOp>(loc, hi_eq, lo_eq, false_val);
     } else if (direction == stablehlo::ComparisonDirection::NE) {
       Value hi_ne = rewriter.create<stablehlo::CompareOp>(loc, lhs_hi, rhs_hi, stablehlo::ComparisonDirection::NE);
       Value lo_ne = rewriter.create<stablehlo::CompareOp>(loc, lhs_lo, rhs_lo, stablehlo::ComparisonDirection::NE);
+      
+      hi_ne = rewriter.create<stablehlo::ReshapeOp>(loc, resultType, hi_ne);
+      lo_ne = rewriter.create<stablehlo::ReshapeOp>(loc, resultType, lo_ne);
+      
+      llvm::errs() << "CompareOpConversion NE SelectOp:\n";
+      llvm::errs() << "  hi_ne type: " << hi_ne.getType() << "\n";
+      llvm::errs() << "  true_val type: " << true_val.getType() << "\n";
+      llvm::errs() << "  lo_ne type: " << lo_ne.getType() << "\n";
+
       res = rewriter.create<stablehlo::SelectOp>(loc, hi_ne, true_val, lo_ne);
     } else {
       stablehlo::ComparisonDirection dir_hi;
@@ -1417,7 +1462,16 @@ struct CompareOpConversion : public OpConversionPattern<stablehlo::CompareOp> {
       Value hi_eq = rewriter.create<stablehlo::CompareOp>(loc, lhs_hi, rhs_hi, stablehlo::ComparisonDirection::EQ);
       Value lo_cond = rewriter.create<stablehlo::CompareOp>(loc, lhs_lo, rhs_lo, dir_lo);
       
+      llvm::errs() << "CompareOpConversion other SelectOp:\n";
+      llvm::errs() << "  hi_eq type: " << hi_eq.getType() << "\n";
+      llvm::errs() << "  lo_cond type: " << lo_cond.getType() << "\n";
+      llvm::errs() << "  hi_gt type: " << hi_gt.getType() << "\n";
+
       res = rewriter.create<stablehlo::SelectOp>(loc, hi_eq, lo_cond, hi_gt);
+    }
+
+    if (res.getType() != resultType) {
+      res = rewriter.create<stablehlo::ReshapeOp>(loc, resultType, res);
     }
 
     rewriter.replaceOp(op, res);
@@ -1524,19 +1578,56 @@ struct DotGeneralOpConversion : public OpConversionPattern<stablehlo::DotGeneral
         op.getPrecisionConfigAttr(), op.getAlgorithmAttr());
 
     auto prodTensorTy = cast<RankedTensorType>(prodType);
-    if (prodTensorTy.getRank() == 0) {
-      Type rank1Ty = RankedTensorType::get({1}, targetType);
-      hi_hi = rewriter.create<stablehlo::ReshapeOp>(loc, rank1Ty, hi_hi);
-      hi_lo = rewriter.create<stablehlo::ReshapeOp>(loc, rank1Ty, hi_lo);
-      lo_hi = rewriter.create<stablehlo::ReshapeOp>(loc, rank1Ty, lo_hi);
-      lo_lo = rewriter.create<stablehlo::ReshapeOp>(loc, rank1Ty, lo_lo);
-    }
-
     Value L = rewriter.create<stablehlo::AddOp>(loc, hi_lo, lo_hi);
     L = rewriter.create<stablehlo::AddOp>(loc, L, lo_lo);
 
+    if (prodTensorTy.getRank() == 0) {
+      Type rank1Ty = RankedTensorType::get({1}, targetType);
+      hi_hi = rewriter.create<stablehlo::ReshapeOp>(loc, rank1Ty, hi_hi);
+      L = rewriter.create<stablehlo::ReshapeOp>(loc, rank1Ty, L);
+    } else {
+      SmallVector<int64_t> packedShape;
+      if (concatDimension == "first") {
+        packedShape.push_back(1);
+        for (auto s : origShape) packedShape.push_back(s);
+      } else {
+        for (auto s : origShape) packedShape.push_back(s);
+        packedShape.push_back(1);
+      }
+      Type packedTy = RankedTensorType::get(packedShape, targetType);
+      hi_hi = rewriter.create<stablehlo::ReshapeOp>(loc, packedTy, hi_hi);
+      L = rewriter.create<stablehlo::ReshapeOp>(loc, packedTy, L);
+    }
+
     Value packed = packLimbs(hi_hi, L, rewriter, loc, concatDimension);
     rewriter.replaceOp(op, packed);
+    return success();
+  }
+};
+
+struct ExtendOpConversion : public OpConversionPattern<enzymexla::ExtendOp> {
+  StringRef concatDimension;
+
+  ExtendOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<enzymexla::ExtendOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(enzymexla::ExtendOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value input = adaptor.getOperands()[0];
+
+    int64_t dim = op.getDimension();
+    if (concatDimension == "first") {
+      dim += 1;
+    }
+
+    Type convertedType = getTypeConverter()->convertType(op.getType());
+    
+    auto newOp = rewriter.create<enzymexla::ExtendOp>(
+        loc, convertedType, input, rewriter.getI64IntegerAttr(dim),
+        op.getLhsAttr(), op.getRhsAttr());
+
+    rewriter.replaceOp(op, newOp.getResult());
     return success();
   }
 };
@@ -2577,7 +2668,7 @@ struct MultiFloatConversionPass
       patterns.add<DynamicUpdateSliceOpConversion>(typeConverter, context, concatDimension, tgtTy);
       patterns.add<GenericOpConversion<enzymexla::RotateOp>>(typeConverter, context);
       patterns.add<GenericOpConversion<enzymexla::WrapOp>>(typeConverter, context);
-      patterns.add<GenericOpConversion<enzymexla::ExtendOp>>(typeConverter, context);
+      patterns.add<ExtendOpConversion>(typeConverter, context, concatDimension);
       patterns.add<GenericOpConversion<stablehlo::SineOp>>(typeConverter, context);
     } else {
       op->emitError() << "Unsupported expansion size specified: " << (int)expansionSize;

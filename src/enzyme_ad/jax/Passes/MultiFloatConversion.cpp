@@ -1605,6 +1605,41 @@ struct DotGeneralOpConversion : public OpConversionPattern<stablehlo::DotGeneral
   }
 };
 
+struct WrapOpConversion : public OpConversionPattern<enzymexla::WrapOp> {
+  StringRef concatDimension;
+
+  WrapOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
+      : OpConversionPattern<enzymexla::WrapOp>(typeConverter, context), concatDimension(concatDimension) {}
+
+  LogicalResult matchAndRewrite(enzymexla::WrapOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value input = adaptor.getOperands()[0];
+
+    int64_t dim = op.getDimension();
+    if (concatDimension == "first") {
+      dim += 1;
+    }
+
+    Type convertedType = getTypeConverter()->convertType(op.getType());
+    
+    SmallVector<NamedAttribute, 4> newAttrs;
+    for (auto attr : op->getAttrs()) {
+      if (attr.getName() == "dimension") {
+        newAttrs.push_back(rewriter.getNamedAttr("dimension", rewriter.getI64IntegerAttr(dim)));
+      } else {
+        newAttrs.push_back(attr);
+      }
+    }
+
+    auto newOp = rewriter.create<enzymexla::WrapOp>(
+        loc, TypeRange{convertedType}, ValueRange{input}, newAttrs);
+
+    rewriter.replaceOp(op, newOp.getResult());
+    return success();
+  }
+};
+
 struct ExtendOpConversion : public OpConversionPattern<enzymexla::ExtendOp> {
   StringRef concatDimension;
 
@@ -1624,8 +1659,8 @@ struct ExtendOpConversion : public OpConversionPattern<enzymexla::ExtendOp> {
     Type convertedType = getTypeConverter()->convertType(op.getType());
     
     auto newOp = rewriter.create<enzymexla::ExtendOp>(
-        loc, convertedType, input, rewriter.getI64IntegerAttr(dim),
-        op.getLhsAttr(), op.getRhsAttr());
+        loc, convertedType, input, op.getLhsAttr(), op.getRhsAttr(),
+        rewriter.getI64IntegerAttr(dim));
 
     rewriter.replaceOp(op, newOp.getResult());
     return success();
@@ -2667,7 +2702,7 @@ struct MultiFloatConversionPass
       patterns.add<GenericOpConversion<stablehlo::NegOp>>(typeConverter, context);
       patterns.add<DynamicUpdateSliceOpConversion>(typeConverter, context, concatDimension, tgtTy);
       patterns.add<GenericOpConversion<enzymexla::RotateOp>>(typeConverter, context);
-      patterns.add<GenericOpConversion<enzymexla::WrapOp>>(typeConverter, context);
+      patterns.add<WrapOpConversion>(typeConverter, context, concatDimension);
       patterns.add<ExtendOpConversion>(typeConverter, context, concatDimension);
       patterns.add<GenericOpConversion<stablehlo::SineOp>>(typeConverter, context);
     } else {

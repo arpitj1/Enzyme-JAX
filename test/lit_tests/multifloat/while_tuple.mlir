@@ -22,9 +22,7 @@ func.func @while(%arg0: tensor<f64>) -> tensor<f64> {
 // CHECK-DAG: %[[ARG_LO:.*]] = stablehlo.get_tuple_element %[[ARG_CAST]][1] : (tuple<tensor<f32>, tensor<f32>>) -> tensor<f32>
 // CHECK: stablehlo.while
 // CHECK-NEXT: cond {
-// CHECK: %[[COND_CST_CAST:.*]] = builtin.unrealized_conversion_cast %{{.*}}, %{{.*}} : tensor<f32>, tensor<f32> to tensor<f64>
-// CHECK: %[[COND_ARG_CAST:.*]] = builtin.unrealized_conversion_cast %{{.*}}, %{{.*}} : tensor<f32>, tensor<f32> to tensor<f64>
-// CHECK: stablehlo.compare {{.*}}, %[[COND_ARG_CAST]], %[[COND_CST_CAST]]
+// CHECK: stablehlo.compare {{.*}}, %{{.*}}, %{{.*}} : (tensor<f32>, tensor<f32>) -> tensor<i1>
 // CHECK: } do {
 // CHECK:        stablehlo.return %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>
 // CHECK-NEXT: }

@@ -114,11 +114,9 @@ Value extractLimb(Value tensor, int limbIndex, OpBuilder &builder, Location loc,
       tensor, builder.getDenseI64ArrayAttr(startIndices),
       builder.getDenseI64ArrayAttr(limitIndices),
       builder.getDenseI64ArrayAttr(strides));
-      
+
   return sliceOp;
 }
-
-
 
 Value packLimbs(ArrayRef<Value> limbs, OpBuilder &builder, Location loc, StringRef concatDimension) {
   bool isTuple = concatDimension == "tuple";
@@ -134,12 +132,7 @@ Value packLimbs(ArrayRef<Value> limbs, OpBuilder &builder, Location loc, StringR
   
   SmallVector<int64_t> outShape = llvm::to_vector(type.getShape());
   outShape[concatDim] = limbs.size();
-  
-  llvm::outs() << "packLimbs called with specified outShape: " << RankedTensorType::get(outShape, type.getElementType()) << "\n";
-  for (Value limb : limbs) {
-    llvm::outs() << "packLimbs limb type: " << limb.getType() << "\n";
-  }
-  
+
   return builder.create<stablehlo::ConcatenateOp>(
       loc, RankedTensorType::get(outShape, type.getElementType()),
       limbs, concatDim);
@@ -1434,13 +1427,13 @@ struct CompareOpConversion : public OpConversionPattern<stablehlo::CompareOp> {
 
 struct DynamicUpdateSliceOpConversion : public OpConversionPattern<stablehlo::DynamicUpdateSliceOp> {
   StringRef concatDimension;
+  Type targetType;
 
-  DynamicUpdateSliceOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension)
-      : OpConversionPattern<stablehlo::DynamicUpdateSliceOp>(typeConverter, context), concatDimension(concatDimension) {}
+  DynamicUpdateSliceOpConversion(TypeConverter &typeConverter, MLIRContext *context, StringRef concatDimension, Type targetType)
+      : OpConversionPattern<stablehlo::DynamicUpdateSliceOp>(typeConverter, context), concatDimension(concatDimension), targetType(targetType) {}
 
   LogicalResult matchAndRewrite(stablehlo::DynamicUpdateSliceOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
-    llvm::errs() << "DynamicUpdateSliceOpConversion called\n";
     Location loc = op.getLoc();
     Value operand = adaptor.getOperands()[0];
     Value update = adaptor.getOperands()[1];
@@ -1452,15 +1445,17 @@ struct DynamicUpdateSliceOpConversion : public OpConversionPattern<stablehlo::Dy
     Value update_lo = extractLimb(update, 1, rewriter, loc, concatDimension);
 
     auto rankNOperandType = cast<RankedTensorType>(op.getOperand().getType());
-    Value operand_hi_N = rewriter.create<stablehlo::ReshapeOp>(loc, rankNOperandType, operand_hi);
-    Value operand_lo_N = rewriter.create<stablehlo::ReshapeOp>(loc, rankNOperandType, operand_lo);
+    auto rankNOperandF32Type = RankedTensorType::get(rankNOperandType.getShape(), targetType);
+    Value operand_hi_N = rewriter.create<stablehlo::ReshapeOp>(loc, rankNOperandF32Type, operand_hi);
+    Value operand_lo_N = rewriter.create<stablehlo::ReshapeOp>(loc, rankNOperandF32Type, operand_lo);
 
     auto rankNUpdateType = cast<RankedTensorType>(op.getUpdate().getType());
-    Value update_hi_N = rewriter.create<stablehlo::ReshapeOp>(loc, rankNUpdateType, update_hi);
-    Value update_lo_N = rewriter.create<stablehlo::ReshapeOp>(loc, rankNUpdateType, update_lo);
+    auto rankNUpdateF32Type = RankedTensorType::get(rankNUpdateType.getShape(), targetType);
+    Value update_hi_N = rewriter.create<stablehlo::ReshapeOp>(loc, rankNUpdateF32Type, update_hi);
+    Value update_lo_N = rewriter.create<stablehlo::ReshapeOp>(loc, rankNUpdateF32Type, update_lo);
 
-    Value hi_N = rewriter.create<stablehlo::DynamicUpdateSliceOp>(loc, rankNOperandType, operand_hi_N, update_hi_N, indices);
-    Value lo_N = rewriter.create<stablehlo::DynamicUpdateSliceOp>(loc, rankNOperandType, operand_lo_N, update_lo_N, indices);
+    Value hi_N = rewriter.create<stablehlo::DynamicUpdateSliceOp>(loc, rankNOperandF32Type, operand_hi_N, update_hi_N, indices);
+    Value lo_N = rewriter.create<stablehlo::DynamicUpdateSliceOp>(loc, rankNOperandF32Type, operand_lo_N, update_lo_N, indices);
 
     auto rankNPlusOneType = cast<RankedTensorType>(operand_hi.getType());
     Value hi = rewriter.create<stablehlo::ReshapeOp>(loc, rankNPlusOneType, hi_N);
@@ -1488,10 +1483,28 @@ struct DotGeneralOpConversion : public OpConversionPattern<stablehlo::DotGeneral
     Value lhs = adaptor.getOperands()[0];
     Value rhs = adaptor.getOperands()[1];
 
+    Type expectedLhsTy = getTypeConverter()->convertType(op.getOperands()[0].getType());
+    Type expectedRhsTy = getTypeConverter()->convertType(op.getOperands()[1].getType());
+
+    if (lhs.getType() != expectedLhsTy) {
+      lhs = rewriter.create<UnrealizedConversionCastOp>(loc, expectedLhsTy, lhs).getResult(0);
+    }
+    if (rhs.getType() != expectedRhsTy) {
+      rhs = rewriter.create<UnrealizedConversionCastOp>(loc, expectedRhsTy, rhs).getResult(0);
+    }
+
     Value lhs_hi = extractLimb(lhs, 0, rewriter, loc, concatDimension);
     Value lhs_lo = extractLimb(lhs, 1, rewriter, loc, concatDimension);
     Value rhs_hi = extractLimb(rhs, 0, rewriter, loc, concatDimension);
     Value rhs_lo = extractLimb(rhs, 1, rewriter, loc, concatDimension);
+
+    auto origLhsTy = cast<RankedTensorType>(op.getOperands()[0].getType());
+    auto origRhsTy = cast<RankedTensorType>(op.getOperands()[1].getType());
+
+    lhs_hi = rewriter.create<stablehlo::ReshapeOp>(loc, RankedTensorType::get(origLhsTy.getShape(), targetType), lhs_hi);
+    lhs_lo = rewriter.create<stablehlo::ReshapeOp>(loc, RankedTensorType::get(origLhsTy.getShape(), targetType), lhs_lo);
+    rhs_hi = rewriter.create<stablehlo::ReshapeOp>(loc, RankedTensorType::get(origRhsTy.getShape(), targetType), rhs_hi);
+    rhs_lo = rewriter.create<stablehlo::ReshapeOp>(loc, RankedTensorType::get(origRhsTy.getShape(), targetType), rhs_lo);
 
     auto origType = cast<RankedTensorType>(op.getType());
     auto origShape = origType.getShape();
@@ -1509,6 +1522,15 @@ struct DotGeneralOpConversion : public OpConversionPattern<stablehlo::DotGeneral
     Value lo_lo = rewriter.create<stablehlo::DotGeneralOp>(
         loc, prodType, lhs_lo, rhs_lo, op.getDotDimensionNumbers(),
         op.getPrecisionConfigAttr(), op.getAlgorithmAttr());
+
+    auto prodTensorTy = cast<RankedTensorType>(prodType);
+    if (prodTensorTy.getRank() == 0) {
+      Type rank1Ty = RankedTensorType::get({1}, targetType);
+      hi_hi = rewriter.create<stablehlo::ReshapeOp>(loc, rank1Ty, hi_hi);
+      hi_lo = rewriter.create<stablehlo::ReshapeOp>(loc, rank1Ty, hi_lo);
+      lo_hi = rewriter.create<stablehlo::ReshapeOp>(loc, rank1Ty, lo_hi);
+      lo_lo = rewriter.create<stablehlo::ReshapeOp>(loc, rank1Ty, lo_lo);
+    }
 
     Value L = rewriter.create<stablehlo::AddOp>(loc, hi_lo, lo_hi);
     L = rewriter.create<stablehlo::AddOp>(loc, L, lo_lo);
@@ -2401,21 +2423,6 @@ struct MultiFloatConversionPass
           returnOp.getOperation()->setOperands(newReturnOperands);
         });
       });
-    } else {
-      llvm::errs() << "MultiFloatConversion: Running else block for non-signature conversion\n";
-      op->walk([&](func::FuncOp func) {
-        if (func.empty()) return;
-        OpBuilder builder(&func.front(), func.front().begin());
-        auto &block = func.front();
-        for (unsigned i = 0; i < block.getNumArguments(); ++i) {
-          Type oldType = block.getArgument(i).getType();
-          Type newType = typeConverter.convertType(oldType);
-          if (oldType != newType) {
-            auto cast = builder.create<UnrealizedConversionCastOp>(func.getLoc(), newType, block.getArgument(i));
-            block.getArgument(i).replaceAllUsesExcept(cast.getResult(0), cast);
-          }
-        }
-      });
     }
 
     target.addLegalOp<UnrealizedConversionCastOp>();
@@ -2567,7 +2574,7 @@ struct MultiFloatConversionPass
       patterns.add<ConvertOpConversion>(typeConverter, context, concatDimension, srcTy, tgtTy, expansionSize);
       patterns.add<CompareOpConversion>(typeConverter, context, concatDimension);
       patterns.add<GenericOpConversion<stablehlo::NegOp>>(typeConverter, context);
-      patterns.add<DynamicUpdateSliceOpConversion>(typeConverter, context, concatDimension);
+      patterns.add<DynamicUpdateSliceOpConversion>(typeConverter, context, concatDimension, tgtTy);
       patterns.add<GenericOpConversion<enzymexla::RotateOp>>(typeConverter, context);
       patterns.add<GenericOpConversion<enzymexla::WrapOp>>(typeConverter, context);
       patterns.add<GenericOpConversion<enzymexla::ExtendOp>>(typeConverter, context);
